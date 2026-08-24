@@ -6,6 +6,14 @@ editable fan curves, and firmware limits — organized like
 [G-Helper](https://github.com/seerge/g-helper), scoped to what your specific
 model actually supports.
 
+| Main | RGB |
+|---|---|
+| ![Main tab](docs/screenshots/main.png) | ![RGB tab](docs/screenshots/rgb.png) |
+
+| Fan | Advanced |
+|---|---|
+| ![Fan tab](docs/screenshots/fan.png) | ![Advanced tab](docs/screenshots/advanced.png) |
+
 ## Why
 
 The stock single-scroll ASUS panel dumps every `asusctl` feature into one
