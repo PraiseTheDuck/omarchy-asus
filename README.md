@@ -105,6 +105,15 @@ omarchy plugin add https://github.com/moneytosms/omarchy-asus.git --enable
 Or clone manually into `~/.config/omarchy/plugins/io.github.moneytosms.asus`
 and enable it via the Omarchy plugin menu.
 
+## Remove
+
+```bash
+omarchy plugin remove io.github.moneytosms.asus
+```
+
+Nothing is written outside the plugin folder and the plugin's own settings
+block in `~/.config/omarchy/shell.json`, which Omarchy drops with the plugin.
+
 ## Configuration
 
 `~/.config/omarchy/shell.json`, under the plugin's settings:
