@@ -11,6 +11,11 @@ Panel {
     ipcTarget: "io.github.moneytosms.asus"
     manageIpc: false
 
+    // Hosts like the Plugin Drawer set this to their own bar button so a
+    // hidden/collapsed widget's panel still opens under the right icon
+    // instead of the (invisible, off-bar) button this plugin owns itself.
+    property var anchorItem: null
+
     // Reusable draggable fan-curve editor. Shows a temp/speed line with
     // draggable points; commits the whole curve via onCommit(points) on
     // release, and offers a per-fan reset via onReset(). Points never leave
@@ -96,6 +101,20 @@ Panel {
                 }
             }
 
+            // Sits under the handles so it never eats a drag, and explains the
+            // axes — the graph has no room for labelled ones.
+            MouseArea {
+                id: curveHelp
+                anchors.fill: parent
+                z: -1
+                hoverEnabled: true
+                acceptedButtons: Qt.NoButton
+            }
+            PanelToolTip {
+                visible: curveHelp.containsMouse
+                text: "Fan curve: temperature (30–100 °C) left to right,\nfan speed (0–100%) bottom to top.\nDrag a point to change it."
+            }
+
             Text {
                 anchors.bottom: parent.bottom; anchors.right: parent.right; anchors.margins: Style.space(2)
                 text: editor.points.length + " pts"
@@ -111,6 +130,7 @@ Panel {
             Button {
                 id: resetBtn
                 text: "Reset"
+                tooltipText: "Restore this profile's default fan curves."
                 fontSize: Style.font.caption
                 foreground: editor.foreground
                 fontFamily: editor.fontFamily
@@ -118,6 +138,51 @@ Panel {
                 verticalPadding: Style.spacing.controlPaddingY
                 bordered: true
                 onClicked: editor.reset()
+            }
+        }
+    }
+
+    // Compact readout tile used by the sensor strip: a caption, a big value,
+    // and an optional second line. Kept dumb so the strip can reflow it into
+    // however many columns the panel width allows.
+    component SensorTile: Rectangle {
+        id: tile
+        property string caption: ""
+        property string value: ""
+        property string sub: ""
+        property color valueColor: "white"
+        property color foreground: "white"
+        property string fontFamily: "monospace"
+        property string tip: ""
+
+        height: Style.space(46)
+        radius: Style.cornerRadius
+        color: Qt.rgba(tile.foreground.r, tile.foreground.g, tile.foreground.b, 0.05)
+
+        MouseArea { id: tileHelp; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
+        PanelToolTip { visible: tile.tip !== "" && tileHelp.containsMouse; text: tile.tip }
+
+        Column {
+            anchors.centerIn: parent
+            spacing: Style.space(1)
+            Text {
+                text: tile.caption
+                color: Qt.darker(tile.foreground, 1.7)
+                font.family: tile.fontFamily; font.pixelSize: Style.font.caption; font.bold: true
+                anchors.horizontalCenter: parent.horizontalCenter
+            }
+            Text {
+                text: tile.value
+                color: tile.valueColor
+                font.family: tile.fontFamily; font.pixelSize: Style.font.subtitle; font.bold: true
+                anchors.horizontalCenter: parent.horizontalCenter
+            }
+            Text {
+                visible: tile.sub !== ""
+                text: tile.sub
+                color: Qt.darker(tile.foreground, 1.5)
+                font.family: tile.fontFamily; font.pixelSize: Style.font.caption
+                anchors.horizontalCenter: parent.horizontalCenter
             }
         }
     }
@@ -133,6 +198,22 @@ Panel {
     property int batteryLimit: 100
     property bool asusctlAvailable: false
     property bool cursorActive: false
+
+    // Live sensors — refreshed on a faster tick than the asusctl state, since
+    // temps and fan speeds are the numbers you actually watch move.
+    property var sensors: ({ cpuTemp: -1, gpuTemp: -1, gpuPower: -1, gpuUtil: -1, fanCpu: -1, fanGpu: -1, batPct: -1, batStatus: "", batPower: -1 })
+    readonly property bool hasNvidia: sensors.gpuTemp >= 0
+
+    // Display — the built-in panel's current/available refresh rates, read
+    // from Hyprland rather than asusctl (which has no display controls).
+    property var monitor: null
+
+    // Whether hyprmoncfg is installed, and whether its daemon is actively
+    // managing displays. When it is, a runtime mode change has to be saved
+    // back into the active profile or the daemon reverts it seconds later.
+    property bool hyprmoncfgAvailable: false
+    property bool hyprmoncfgManaged: false
+    property string hyprmoncfgProfile: ""
 
     // ---- Tabs -----------------------------------------------------------
     property string tabKey: "main"
@@ -161,6 +242,8 @@ Panel {
     property string currentSpeed: "med"
     property string currentDirection: "left"
     property bool ledAwake: true
+    property bool ledBoot: true
+    property bool ledSleep: true
     property string ledBrightness: "med"
     readonly property string colorHex: Model.rgbToHex(colorR, colorG, colorB)
     readonly property string color2Hex: Model.rgbToHex(color2R, color2G, color2B)
@@ -182,11 +265,17 @@ Panel {
     property var cpuFanPoints: []
     property var gpuFanPoints: []
     property var midFanPoints: []
+    // Which profile's curves the Fan tab is editing. asusctl stores one curve
+    // set per power profile, so — like G-Helper — the editor targets a chosen
+    // profile rather than silently always writing the active one.
+    property string fanEditProfile: ""
+    readonly property string fanProfile: fanEditProfile || currentProfile || "Balanced"
 
     // Armoury — armourySupported gates each Advanced control per-model, since
     // `asusctl armoury list` only reports attributes the running laptop
     // actually exposes (no dGPU / no panel overdrive on some models).
     property var armourySupported: ({ panelOverdrive: false, gpuMux: false, dgpuDisable: false, pptPl1: false, pptPl2: false, nvDynBoost: false, nvTempTarget: false })
+    property var armouryDefaults: ({})
     property bool panelOverdrive: false
     property bool gpuMux: false
     property bool dgpuDisable: false
@@ -197,7 +286,16 @@ Panel {
     property int pptPl2Min: 35
     property int pptPl2Max: 60
     property int nvDynBoost: 25
+    property int nvDynBoostMin: 0
+    property int nvDynBoostMax: 25
     property int nvTempTarget: 87
+    property int nvTempTargetMin: 75
+    property int nvTempTargetMax: 87
+
+    // GPU mode is derived from the mux/dgpu pair rather than stored, so it
+    // can never drift out of sync with what the firmware actually reports.
+    readonly property string gpuMode: Model.gpuModeId(gpuMux, dgpuDisable)
+    readonly property bool hasGpuMode: armourySupported.gpuMux || armourySupported.dgpuDisable
 
     readonly property bool showBatteryLimit: setting("showBatteryLimit", true) === true
     readonly property int refreshInterval: Math.max(5, Math.min(60, Number(setting("refreshIntervalSec", 10)) || 10)) * 1000
@@ -209,6 +307,8 @@ Panel {
         if (supported.hasBattery && !batteryProc.running) batteryProc.running = true
         if (!ledProc.running) ledProc.running = true
         if (!armouryProc.running) armouryProc.running = true
+        if (!monitorProc.running) monitorProc.running = true
+        if (hyprmoncfgAvailable && !hyprmoncfgProc.running) hyprmoncfgProc.running = true
         if (supported.hasFanCurve) { if (!fanDetailProc.running) fanDetailProc.running = true }
     }
 
@@ -228,7 +328,19 @@ Panel {
     function setPresetColor(hex) { var r = Model.hexToRgb(hex); colorR = r.r; colorG = r.g; colorB = r.b; applyEffect() }
     function setPresetColor2(hex) { var r = Model.hexToRgb(hex); color2R = r.r; color2G = r.g; color2B = r.b; applyEffect() }
 
-    function setLedPower(on) { ledAwake = on; actionProc.command = ["asusctl", "aura", "power-tuf", "--awake", on ? "true" : "false", "--keyboard"]; actionProc.running = true }
+    // power-tuf takes all three states in one call, so each toggle resends the
+    // full triple — sending only the changed flag makes asusctl default the
+    // omitted ones back to false.
+    function applyLedPower() {
+        actionProc.command = ["asusctl", "aura", "power-tuf",
+                              "--awake", ledAwake ? "true" : "false", "--keyboard",
+                              "--boot", ledBoot ? "true" : "false",
+                              "--sleep", ledSleep ? "true" : "false"]
+        actionProc.running = true
+    }
+    function setLedPower(on) { ledAwake = on; applyLedPower() }
+    function setLedBoot(on) { ledBoot = on; applyLedPower() }
+    function setLedSleep(on) { ledSleep = on; applyLedPower() }
     function setLedBrightness(level) { ledBrightness = level; actionProc.command = ["asusctl", "leds", "set", level]; actionProc.running = true }
     function setBatteryLimit(l) { if (!supported.hasBattery) return; var c = Math.max(20, Math.min(100, Math.round(l))); actionProc.command = ["asusctl", "battery", "limit", String(c)]; actionProc.running = true }
 
@@ -236,26 +348,60 @@ Panel {
     // silently lands on the wrong (hardcoded "Balanced") profile because the
     // real active profile hadn't loaded yet. This was the root cause of fan
     // controls appearing to "not work sometimes".
-    function toggleFanCurves() { if (!supported.hasFanCurve || !profileLoaded) return; var n = !fanCurveEnabled; var p = currentProfile || "Balanced"; actionProc.command = ["asusctl", "fan-curve", "--mod-profile", p, "--enable-fan-curves", n ? "true" : "false"]; actionProc.running = true }
-    function toggleCpuFan() { if (!profileLoaded) return; var n = !cpuFanEnabled; var p = currentProfile || "Balanced"; actionProc.command = ["asusctl", "fan-curve", "--mod-profile", p, "--enable-fan-curve", n ? "true" : "false", "--fan", "cpu"]; actionProc.running = true }
-    function toggleGpuFan() { if (!profileLoaded) return; var n = !gpuFanEnabled; var p = currentProfile || "Balanced"; actionProc.command = ["asusctl", "fan-curve", "--mod-profile", p, "--enable-fan-curve", n ? "true" : "false", "--fan", "gpu"]; actionProc.running = true }
-    function toggleMidFan() { if (!profileLoaded || !hasMidFan) return; var n = !midFanEnabled; var p = currentProfile || "Balanced"; actionProc.command = ["asusctl", "fan-curve", "--mod-profile", p, "--enable-fan-curve", n ? "true" : "false", "--fan", "mid"]; actionProc.running = true }
-    function resetFanCurves() { if (!profileLoaded) return; var p = currentProfile || "Balanced"; actionProc.command = ["asusctl", "fan-curve", "--mod-profile", p, "--default"]; actionProc.running = true }
+    function toggleFanCurves() { if (!supported.hasFanCurve || !profileLoaded) return; var n = !fanCurveEnabled; actionProc.command = ["asusctl", "fan-curve", "--mod-profile", fanProfile, "--enable-fan-curves", n ? "true" : "false"]; actionProc.running = true }
+    function toggleCpuFan() { if (!profileLoaded) return; var n = !cpuFanEnabled; actionProc.command = ["asusctl", "fan-curve", "--mod-profile", fanProfile, "--enable-fan-curve", n ? "true" : "false", "--fan", "cpu"]; actionProc.running = true }
+    function toggleGpuFan() { if (!profileLoaded) return; var n = !gpuFanEnabled; actionProc.command = ["asusctl", "fan-curve", "--mod-profile", fanProfile, "--enable-fan-curve", n ? "true" : "false", "--fan", "gpu"]; actionProc.running = true }
+    function toggleMidFan() { if (!profileLoaded || !hasMidFan) return; var n = !midFanEnabled; actionProc.command = ["asusctl", "fan-curve", "--mod-profile", fanProfile, "--enable-fan-curve", n ? "true" : "false", "--fan", "mid"]; actionProc.running = true }
+    function resetFanCurves() { if (!profileLoaded) return; actionProc.command = ["asusctl", "fan-curve", "--mod-profile", fanProfile, "--default"]; actionProc.running = true }
     function applyFanCurve(fan, points) {
         if (!profileLoaded || actionProc.running) return
-        var p = currentProfile || "Balanced"
-        actionProc.command = ["asusctl", "fan-curve", "--mod-profile", p, "--fan", fan, "--data", Model.serializeFanPoints(points)]
+        actionProc.command = ["asusctl", "fan-curve", "--mod-profile", fanProfile, "--fan", fan, "--data", Model.serializeFanPoints(points)]
         actionProc.running = true
     }
+    function selectFanProfile(p) { if (!p || p === fanProfile) return; fanEditProfile = p; if (!fanModProc.running) fanModProc.running = true }
 
     function setArmouryAttr(a, v) { actionProc.command = ["asusctl", "armoury", "set", a, String(v)]; actionProc.running = true }
     function togglePanelOverdrive() { panelOverdrive = !panelOverdrive; setArmouryAttr("panel_overdrive", panelOverdrive ? 1 : 0) }
-    function toggleGpuMux() { gpuMux = !gpuMux; setArmouryAttr("gpu_mux_mode", gpuMux ? 1 : 0) }
-    function toggleDgpuDisable() { dgpuDisable = !dgpuDisable; setArmouryAttr("dgpu_disable", dgpuDisable ? 1 : 0) }
     function setPptPl1(v) { pptPl1 = Math.round(v); setArmouryAttr("ppt_pl1_spl", pptPl1) }
     function setPptPl2(v) { pptPl2 = Math.round(v); setArmouryAttr("ppt_pl2_sppt", pptPl2) }
     function setNvDynBoost(v) { nvDynBoost = Math.round(v); setArmouryAttr("nv_dynamic_boost", nvDynBoost) }
     function setNvTempTarget(v) { nvTempTarget = Math.round(v); setArmouryAttr("nv_temp_target", nvTempTarget) }
+    // Firmware ships a sane default per attribute; `asusctl armoury list`
+    // reports it, so "Defaults" is just replaying those values.
+    function restorePowerDefaults() {
+        var d = root.armouryDefaults
+        if (d.ppt_pl1_spl !== undefined) setPptPl1(d.ppt_pl1_spl)
+        if (d.ppt_pl2_sppt !== undefined) setPptPl2(d.ppt_pl2_sppt)
+        if (d.nv_dynamic_boost !== undefined) setNvDynBoost(d.nv_dynamic_boost)
+        if (d.nv_temp_target !== undefined) setNvTempTarget(d.nv_temp_target)
+    }
+
+    // GPU mode — Eco/Standard/Ultimate collapse to the mux + dgpu_disable
+    // pair. Only the attribute that actually changes is written, so an Eco
+    // switch on a mux-less laptop is still a single valid call.
+    function setGpuMode(id) {
+        var def = Model.gpuModeDef(id)
+        if (armourySupported.gpuMux && (def.mux === 1) !== gpuMux) {
+            gpuMux = def.mux === 1
+            setArmouryAttr("gpu_mux_mode", def.mux)
+            return
+        }
+        if (armourySupported.dgpuDisable && (def.dgpuDisable === 1) !== dgpuDisable) {
+            dgpuDisable = def.dgpuDisable === 1
+            setArmouryAttr("dgpu_disable", def.dgpuDisable)
+        }
+    }
+
+    // Applying a refresh rate is two steps where hyprmoncfg is managing
+    // displays: change it live, then persist it into the daemon's active
+    // profile. Without that second step hyprmoncfgd re-applies its saved
+    // profile a few seconds later and the change silently reverts. On a
+    // machine without the daemon the first step alone is the whole job.
+    function setRefreshRate(hz) {
+        if (!monitor || displayProc.running || hyprmoncfgSaveProc.running) return
+        displayProc.command = Model.monitorCommand(monitor, hz)
+        displayProc.running = true
+    }
 
     visible: asusctlAvailable
     implicitWidth: asusctlAvailable ? button.implicitWidth : 0
@@ -264,20 +410,35 @@ Panel {
     BarIconButton {
         id: button; anchors.fill: parent; bar: root.bar
         text: Model.profileIcon(currentProfile); slotSize: Style.bar.iconSlot
-        tooltipText: "ASUS — " + Model.profileLabel(currentProfile)
+        // Tooltip doubles as the at-a-glance sensor readout, so the common
+        // "how hot is it right now" question needs no click at all.
+        tooltipText: {
+            var t = "ASUS — " + Model.profileLabel(root.currentProfile)
+            if (root.sensors.cpuTemp >= 0) t += "\nCPU  " + Model.fmtTemp(root.sensors.cpuTemp) + "   " + Model.fmtRpm(root.sensors.fanCpu)
+            if (root.sensors.gpuTemp >= 0) t += "\nGPU  " + Model.fmtTemp(root.sensors.gpuTemp) + "   " + Model.fmtRpm(root.sensors.fanGpu)
+            return t
+        }
         onPressed: function(b) { root.toggle() }
+        // Scroll cycles profiles without opening the panel — the fastest path
+        // to Silent/Turbo, and what `cycleProfile` was written for.
+        onWheelMoved: function(delta) { root.cycleProfile(delta > 0 ? 1 : -1) }
     }
 
     KeyboardPanel {
-        id: panel; anchorItem: button; owner: root; bar: root.bar
+        id: panel; anchorItem: root.anchorItem || button; owner: root; bar: root.bar
         open: root.opened && root.asusctlAvailable; focusTarget: keyCatcher
-        contentWidth: panel.fittedContentWidth(Style.space(360))
-        contentHeight: panel.fittedContentHeight(scrollCol.implicitHeight)
+        // The Flickable inside is inset by `flickMargin` on every side, so the
+        // panel has to be asked for that much extra in both axes — sizing it
+        // to the raw content height clipped the final row of whichever tab was
+        // showing (the last slider on Advanced, the overdrive toggle on Main).
+        readonly property real flickMargin: Style.space(12)
+        contentWidth: panel.fittedContentWidth(Style.space(360) + flickMargin * 2)
+        contentHeight: panel.fittedContentHeight(scrollCol.implicitHeight + flickMargin * 2)
 
         Flickable {
             id: flick
             anchors.fill: parent
-            anchors.margins: Style.space(12)
+            anchors.margins: panel.flickMargin
             contentHeight: scrollCol.implicitHeight
             clip: true
             flickableDirection: Flickable.VerticalFlick
@@ -287,18 +448,9 @@ Panel {
                 width: parent.width
                 spacing: Style.space(12)
 
-                // HERO
-                Item { width: parent.width; implicitHeight: Math.max(hIcon.implicitHeight, hLabels.implicitHeight)
-                    Text { id: hIcon; text: "\u{F14C0}"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.display; anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter }
-                    Column { id: hLabels; anchors.left: hIcon.right; anchors.leftMargin: Style.space(14); anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; spacing: Style.space(2)
-                        Text { text: "ASUS Control"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.title; font.bold: true; elide: Text.ElideRight; width: parent.width }
-                        Text { text: Model.profileLabel(root.currentProfile).toUpperCase(); color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; font.letterSpacing: 1.2 }
-                    }
-                }
-
-                PanelSeparator { foreground: root.bar.foreground }
-
-                // TABS
+                // TABS — no hero header; the bar icon + active tab already
+                // identify the panel, so the title/profile line is dropped
+                // to give tab content more room before it needs to scroll.
                 Row {
                     id: tabRow
                     width: parent.width
@@ -323,10 +475,430 @@ Panel {
                     }
                 }
 
-                Loader { width: parent.width; active: root.tabKey === "main"; visible: active; sourceComponent: mainTab }
-                Loader { width: parent.width; active: root.tabKey === "rgb"; visible: active; sourceComponent: rgbTab }
-                Loader { width: parent.width; active: root.tabKey === "fan"; visible: active; sourceComponent: fanTab }
-                Loader { width: parent.width; active: root.tabKey === "advanced"; visible: active; sourceComponent: advancedTab }
+                PanelSeparator { foreground: root.bar.foreground }
+
+                // Tab bodies are plain always-built Columns toggled by `visible`
+                // rather than Loader/Component — Quickshell's incubator can take
+                // multiple frames to finish building a freshly-activated Loader's
+                // Component, which showed up as tab content intermittently
+                // rendering blank/short right after opening. Building everything
+                // up front as part of the panel's normal synchronous construction
+                // avoids that race entirely.
+
+                // ============================================================ MAIN TAB
+                Column { visible: root.tabKey === "main"; width: parent.width; spacing: Style.space(12)
+
+                    // LIVE SENSORS — G-Helper's home screen leads with temps
+                    // and fan speeds, so this sits above the controls. Tiles
+                    // for hardware that reports nothing stay hidden rather
+                    // than showing a dash forever.
+                    Grid {
+                        id: sensorGrid
+                        width: parent.width
+                        columns: 2
+                        spacing: Style.space(6)
+                        readonly property real cw: (width - spacing) / 2
+
+                        SensorTile {
+                            width: sensorGrid.cw
+                            caption: "CPU"
+                            tip: "Package temperature and the CPU fan's current speed.\nSustained load on this laptop settles around 80–95 °C."
+                            value: Model.fmtTemp(root.sensors.cpuTemp)
+                            sub: Model.fmtRpm(root.sensors.fanCpu)
+                            valueColor: Model.tempColor(root.sensors.cpuTemp)
+                            foreground: root.bar.foreground; fontFamily: root.bar.fontFamily
+                        }
+                        SensorTile {
+                            visible: root.hasNvidia
+                            width: sensorGrid.cw
+                            caption: "GPU"
+                            tip: "Discrete GPU temperature, its fan speed, and how busy it is.\nIdles near 0% when nothing is using the dGPU."
+                            value: Model.fmtTemp(root.sensors.gpuTemp)
+                            sub: Model.fmtRpm(root.sensors.fanGpu) + (root.sensors.gpuUtil >= 0 ? "   " + root.sensors.gpuUtil + "%" : "")
+                            valueColor: Model.tempColor(root.sensors.gpuTemp)
+                            foreground: root.bar.foreground; fontFamily: root.bar.fontFamily
+                        }
+                        SensorTile {
+                            visible: root.sensors.batPct >= 0
+                            width: sensorGrid.cw
+                            caption: "BATTERY"
+                            tip: "Charge level, whether it is charging, and the current\nflow in watts — draw when discharging, fill rate when charging."
+                            value: root.sensors.batPct + "%"
+                            sub: root.sensors.batStatus + (root.sensors.batPower > 0 ? "   " + Model.fmtWatts(root.sensors.batPower) : "")
+                            valueColor: root.sensors.batPct <= 15 && root.sensors.batStatus !== "Charging" ? "#ff4444" : root.bar.foreground
+                            foreground: root.bar.foreground; fontFamily: root.bar.fontFamily
+                        }
+                        SensorTile {
+                            visible: root.hasNvidia && root.sensors.gpuPower >= 0
+                            width: sensorGrid.cw
+                            caption: "GPU POWER"
+                            tip: "Watts the discrete GPU is currently drawing, and the\ndynamic boost ceiling set on the Advanced tab."
+                            value: root.sensors.gpuPower + " W"
+                            sub: "boost " + root.nvDynBoost + "W"
+                            valueColor: root.bar.foreground
+                            foreground: root.bar.foreground; fontFamily: root.bar.fontFamily
+                        }
+                    }
+
+                    Column { width: parent.width; spacing: Style.space(8)
+                        PanelSeparator { foreground: root.bar.foreground }
+                        PanelSectionHeader { text: "PERFORMANCE MODE"; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily }
+                        Row { id: pRow; width: parent.width; spacing: Style.space(4); readonly property real cw: root.profiles.length > 0 ? (width - spacing * (root.profiles.length - 1)) / root.profiles.length : 0
+                            Repeater { model: root.profiles
+                                Button { required property var modelData; required property int index; width: pRow.cw; iconText: Model.profileIcon(String(modelData)); iconSize: Style.font.title; text: String(modelData); tooltipText: Model.profileDescription(String(modelData)); fontSize: Style.font.bodySmall; foreground: root.currentProfile === modelData ? Model.profileColor(String(modelData)) : root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; active: root.currentProfile === modelData; hasCursor: root.cursorActive && root.profileIndex === index; onClicked: root.setProfile(modelData); onHovered: function(h) { if (h) { root.cursorActive = true; root.profileIndex = index } } }
+                            }
+                        }
+                    }
+
+                    // GPU MODE — Eco / Standard / Ultimate, mirroring G-Helper.
+                    Column { visible: root.hasGpuMode; width: parent.width; spacing: Style.space(8)
+                        PanelSeparator { foreground: root.bar.foreground }
+                        PanelSectionHeader { text: "GPU MODE"; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily }
+                        Row { id: gRow; width: parent.width; spacing: Style.space(4); readonly property real cw: (width - spacing * 2) / 3
+                            Repeater { model: Model.gpuModes
+                                Button {
+                                    required property var modelData
+                                    width: gRow.cw
+                                    // Ultimate needs the mux; hiding it outright would
+                                    // shuffle the row, so it is disabled instead.
+                                    enabled: modelData.id !== "ultimate" ? root.armourySupported.dgpuDisable || root.armourySupported.gpuMux : root.armourySupported.gpuMux
+                                    opacity: enabled ? 1 : 0.4
+                                    iconText: modelData.icon; iconSize: Style.font.title
+                                    text: modelData.name
+                                    tooltipText: enabled ? modelData.tip : modelData.tip + "\n\nNot available: this laptop has no MUX switch."
+                                    fontSize: Style.font.bodySmall
+                                    foreground: root.bar.foreground; fontFamily: root.bar.fontFamily
+                                    horizontalPadding: Style.spacing.controlPaddingX
+                                    verticalPadding: Style.spacing.controlPaddingY
+                                    bordered: true
+                                    active: root.gpuMode === modelData.id
+                                    onClicked: root.setGpuMode(modelData.id)
+                                }
+                            }
+                        }
+                        Text { width: parent.width; text: Model.gpuModeDef(root.gpuMode).desc; wrapMode: Text.WordWrap; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption }
+                    }
+
+                    // SCREEN — refresh rate comes from Hyprland, overdrive from
+                    // asusctl; G-Helper pairs them in one control for the same
+                    // reason (high refresh without OD looks smeary).
+                    Column { visible: root.monitor !== null && root.monitor.rates.length > 1; width: parent.width; spacing: Style.space(8)
+                        PanelSeparator { foreground: root.bar.foreground }
+                        PanelSectionHeader { text: "SCREEN — " + (root.monitor ? root.monitor.name : "") + (root.hyprmoncfgManaged ? "  ·  " + root.hyprmoncfgProfile : ""); foreground: root.bar.foreground; fontFamily: root.bar.fontFamily }
+                        Row { id: hzRow; width: parent.width; spacing: Style.space(4); readonly property int n: root.monitor ? root.monitor.rates.length : 1; readonly property real cw: (width - spacing * (n - 1)) / Math.max(1, n)
+                            Repeater { model: root.monitor ? root.monitor.rates : []
+                                Button { required property var modelData; width: hzRow.cw; text: modelData + " Hz"; tooltipText: "Run " + (root.monitor ? root.monitor.name : "the panel") + " at " + modelData + " Hz.\n" + (modelData >= 90 ? "Smoother motion, noticeably more battery drain." : "Lower power draw, longer battery life.") + (root.hyprmoncfgManaged ? "\n\nSaved into the hyprmoncfg profile \"" + root.hyprmoncfgProfile + "\", so it sticks." : "\n\nApplied until the Hyprland config is reloaded."); fontSize: Style.font.bodySmall; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; active: root.monitor && root.monitor.rate === modelData; onClicked: root.setRefreshRate(modelData) }
+                            }
+                        }
+                        Toggle {
+                            id: odToggle
+                            visible: root.armourySupported.panelOverdrive
+                            width: parent.width
+                            label: "Panel Overdrive"
+                            description: "Faster pixel response at high refresh"
+                            checked: root.panelOverdrive
+                            foreground: root.bar.foreground; accent: Color.accent; fontFamily: root.bar.fontFamily
+                            onClicked: root.togglePanelOverdrive()
+                            // Toggle reports hover as a signal rather than a
+                            // property, so the tooltip tracks it via a flag.
+                            property bool tipHovered: false
+                            onHovered: function(h) { odToggle.tipHovered = h }
+                            PanelToolTip { visible: odToggle.tipHovered; text: Model.armouryTips.panel_overdrive }
+                        }
+                    }
+
+                    Column { visible: root.supported.hasBattery && root.showBatteryLimit; width: parent.width; spacing: Style.space(8)
+                        PanelSeparator { foreground: root.bar.foreground }
+                        PanelSectionHeader { text: "BATTERY CHARGE LIMIT"; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily }
+                        Row { width: parent.width; spacing: Style.space(4)
+                            PanelSlider { width: parent.width - Style.space(44) - Style.space(4); bar: root.bar; minimum: 20; maximum: 100; step: 5; integer: true; value: root.batteryLimit; tickCount: 9; onReleased: function(v) { root.setBatteryLimit(Math.round(v)) } }
+                            Text { text: root.batteryLimit + "%"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.body; font.bold: true; width: Style.space(44); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
+                        }
+                        Row { width: parent.width; spacing: Style.space(4)
+                            Repeater { model: [20, 40, 60, 80, 100]
+                                Button { required property var modelData; width: (parent.width - Style.space(4) * 4) / 5; text: modelData + "%"; tooltipText: modelData === 100 ? "Charge to full.\nConvenient, but hardest on long-term battery health." : "Stop charging at " + modelData + "%.\nLower limits slow battery wear; 60–80% suits a mostly plugged-in laptop."; fontSize: Style.font.caption; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; active: root.batteryLimit === modelData; onClicked: root.setBatteryLimit(modelData) }
+                            }
+                        }
+                    }
+                }
+
+                // ============================================================= RGB TAB
+                Column { visible: root.tabKey === "rgb"; width: parent.width; spacing: Style.space(8)
+                    // Header with LED toggle
+                    Row { width: parent.width
+                        Text { text: "KEYBOARD RGB"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.subtitle; font.bold: true; anchors.verticalCenter: parent.verticalCenter; width: parent.width - ledSw.width - Style.space(8) }
+                        Row { id: ledSw; spacing: Style.space(4); anchors.verticalCenter: parent.verticalCenter
+                            Rectangle { width: Style.space(14); height: Style.space(14); radius: Style.space(7); color: root.ledAwake ? "#44cc44" : "#cc4444"; anchors.verticalCenter: parent.verticalCenter
+                                SequentialAnimation on opacity { running: root.ledAwake; loops: Animation.Infinite; NumberAnimation { from: 1; to: 0.5; duration: 800 } NumberAnimation { from: 0.5; to: 1; duration: 800 } }
+                            }
+                            Text { text: root.ledAwake ? "ON" : "OFF"; color: root.ledAwake ? "#44cc44" : "#cc4444"; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; anchors.verticalCenter: parent.verticalCenter }
+                            MouseArea { id: ledPowerMouse; width: Style.space(40); height: Style.space(20); anchors.verticalCenter: parent.verticalCenter; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.setLedPower(!root.ledAwake)
+                                PanelToolTip { visible: ledPowerMouse.containsMouse; text: root.ledAwake ? "Keyboard lighting is on. Click to turn it off." : "Keyboard lighting is off. Click to turn it on." }
+                            }
+                        }
+                    }
+                    // Effect grid — only modes this laptop's asusctl actually reports supporting.
+                    Grid { width: parent.width; columns: 3; spacing: Style.space(3)
+                        Repeater { model: root.auraSupportedEffects
+                            Rectangle { required property var modelData; width: (parent.width - Style.space(3) * 2) / 3; height: Style.space(40); radius: Style.cornerRadius; color: root.currentEffect === modelData.id ? Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.2) : Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.06); border.width: root.currentEffect === modelData.id ? 2 : 1; border.color: root.currentEffect === modelData.id ? root.bar.foreground : "transparent"
+                                Row { anchors.centerIn: parent; spacing: Style.space(4)
+                                    Text { text: modelData.icon; color: root.currentEffect === modelData.id ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.body }
+                                    Text { text: modelData.name; color: root.currentEffect === modelData.id ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.6); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; anchors.verticalCenter: parent.verticalCenter }
+                                }
+                                MouseArea { id: fxMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.selectEffect(modelData.id) }
+                                PanelToolTip { visible: fxMouse.containsMouse; text: modelData.tip }
+                            }
+                        }
+                    }
+                    // Effect params
+                    Column { visible: root.needsColor || root.needsColor2 || root.needsSpeed || root.needsDirection; width: parent.width; spacing: Style.space(6)
+                        Column { visible: root.needsColor; width: parent.width; spacing: Style.space(4)
+                            Row { width: parent.width; spacing: Style.space(6)
+                                Rectangle { width: Style.space(20); height: Style.space(20); radius: Style.space(10); color: root.liveColor; border.width: 1; border.color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.3); anchors.verticalCenter: parent.verticalCenter }
+                                Text { text: "Color  #" + root.colorHex.toUpperCase(); color: root.bar.foreground; font.family: "monospace"; font.pixelSize: Style.font.caption; anchors.verticalCenter: parent.verticalCenter }
+                                Item { width: parent.width - Style.space(20) - Style.space(60) - Style.space(6) * 2; height: 1 }
+                                Button { text: "Set"; fontSize: Style.font.caption; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; active: true; anchors.verticalCenter: parent.verticalCenter; onClicked: root.applyEffect() }
+                            }
+                            Row { width: parent.width; spacing: Style.space(4)
+                                Text { text: "R"; color: "#ff4444"; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(12); anchors.verticalCenter: parent.verticalCenter }
+                                PanelSlider { width: parent.width - Style.space(12) - Style.space(24) - Style.space(4) * 2; bar: root.bar; minimum: 0; maximum: 255; step: 1; integer: true; value: root.colorR; fillColor: Qt.rgba(1, 0.2, 0.2, 1); knobColor: Qt.rgba(1, 0.3, 0.3, 1); onReleased: function(v) { root.colorR = Math.round(v) } }
+                                Text { text: root.colorR; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(24); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
+                            }
+                            Row { width: parent.width; spacing: Style.space(4)
+                                Text { text: "G"; color: "#44cc44"; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(12); anchors.verticalCenter: parent.verticalCenter }
+                                PanelSlider { width: parent.width - Style.space(12) - Style.space(24) - Style.space(4) * 2; bar: root.bar; minimum: 0; maximum: 255; step: 1; integer: true; value: root.colorG; fillColor: Qt.rgba(0.2, 1, 0.2, 1); knobColor: Qt.rgba(0.3, 1, 0.3, 1); onReleased: function(v) { root.colorG = Math.round(v) } }
+                                Text { text: root.colorG; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(24); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
+                            }
+                            Row { width: parent.width; spacing: Style.space(4)
+                                Text { text: "B"; color: "#4488ff"; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(12); anchors.verticalCenter: parent.verticalCenter }
+                                PanelSlider { width: parent.width - Style.space(12) - Style.space(24) - Style.space(4) * 2; bar: root.bar; minimum: 0; maximum: 255; step: 1; integer: true; value: root.colorB; fillColor: Qt.rgba(0.2, 0.2, 1, 1); knobColor: Qt.rgba(0.3, 0.3, 1, 1); onReleased: function(v) { root.colorB = Math.round(v) } }
+                                Text { text: root.colorB; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(24); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
+                            }
+                        }
+                        Column { visible: root.needsColor2; width: parent.width; spacing: Style.space(4)
+                            Row { width: parent.width; spacing: Style.space(6)
+                                Rectangle { width: Style.space(20); height: Style.space(20); radius: Style.space(10); color: root.liveColor2; border.width: 1; border.color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.3); anchors.verticalCenter: parent.verticalCenter }
+                                Text { text: "Color 2  #" + root.color2Hex.toUpperCase(); color: root.bar.foreground; font.family: "monospace"; font.pixelSize: Style.font.caption; anchors.verticalCenter: parent.verticalCenter }
+                            }
+                            Row { width: parent.width; spacing: Style.space(4)
+                                Text { text: "R"; color: "#ff4444"; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(12); anchors.verticalCenter: parent.verticalCenter }
+                                PanelSlider { width: parent.width - Style.space(12) - Style.space(24) - Style.space(4) * 2; bar: root.bar; minimum: 0; maximum: 255; step: 1; integer: true; value: root.color2R; fillColor: Qt.rgba(1, 0.2, 0.2, 1); knobColor: Qt.rgba(1, 0.3, 0.3, 1); onReleased: function(v) { root.color2R = Math.round(v) } }
+                                Text { text: root.color2R; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(24); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
+                            }
+                            Row { width: parent.width; spacing: Style.space(4)
+                                Text { text: "G"; color: "#44cc44"; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(12); anchors.verticalCenter: parent.verticalCenter }
+                                PanelSlider { width: parent.width - Style.space(12) - Style.space(24) - Style.space(4) * 2; bar: root.bar; minimum: 0; maximum: 255; step: 1; integer: true; value: root.color2G; fillColor: Qt.rgba(0.2, 1, 0.2, 1); knobColor: Qt.rgba(0.3, 1, 0.3, 1); onReleased: function(v) { root.color2G = Math.round(v) } }
+                                Text { text: root.color2G; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(24); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
+                            }
+                            Row { width: parent.width; spacing: Style.space(4)
+                                Text { text: "B"; color: "#4488ff"; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(12); anchors.verticalCenter: parent.verticalCenter }
+                                PanelSlider { width: parent.width - Style.space(12) - Style.space(24) - Style.space(4) * 2; bar: root.bar; minimum: 0; maximum: 255; step: 1; integer: true; value: root.color2B; fillColor: Qt.rgba(0.2, 0.2, 1, 1); knobColor: Qt.rgba(0.3, 0.3, 1, 1); onReleased: function(v) { root.color2B = Math.round(v) } }
+                                Text { text: root.color2B; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(24); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
+                            }
+                        }
+                        Row { visible: root.needsSpeed; width: parent.width; spacing: Style.space(4)
+                            Text { text: "Speed"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; anchors.verticalCenter: parent.verticalCenter; width: Style.space(40) }
+                            Repeater { model: Model.speeds
+                                Button { required property var modelData; width: (parent.width - Style.space(40) - Style.space(4) * 2) / 3; text: Model.speedLabels[modelData]; tooltipText: "How fast the " + root.effectDef.name + " effect animates."; fontSize: Style.font.caption; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; active: root.currentSpeed === modelData; onClicked: { root.currentSpeed = modelData; root.applyEffect() } }
+                            }
+                        }
+                        Row { visible: root.needsDirection; width: parent.width; spacing: Style.space(4)
+                            Text { text: "Dir"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; anchors.verticalCenter: parent.verticalCenter; width: Style.space(40) }
+                            Repeater { model: Model.directions
+                                Button { required property var modelData; width: (parent.width - Style.space(40) - Style.space(4) * 3) / 4; text: modelData.charAt(0).toUpperCase() + modelData.slice(1); tooltipText: "Animate the effect towards the " + modelData + "."; fontSize: Style.font.caption; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; active: root.currentDirection === modelData; onClicked: { root.currentDirection = modelData; root.applyEffect() } }
+                            }
+                        }
+                        Grid { visible: root.needsColor; width: parent.width; columns: 6; spacing: Style.space(3)
+                            Repeater {
+                                model: ["ff0000", "ff8800", "ffff00", "00ff00", "00ffff", "0088ff", "aa00ff", "ff00ff", "ffffff", "ffaa44", "44ccff", "88ff00"]
+                                Rectangle {
+                                    required property string modelData
+                                    property color swatchColor: Qt.rgba(
+                                        parseInt(modelData.substring(0, 2), 16) / 255,
+                                        parseInt(modelData.substring(2, 4), 16) / 255,
+                                        parseInt(modelData.substring(4, 6), 16) / 255,
+                                        1
+                                    )
+                                    width: (parent.width - Style.space(3) * 5) / 6
+                                    height: Style.space(22)
+                                    radius: Style.space(4)
+                                    color: swatchColor
+                                    border.width: root.colorHex === modelData ? 2 : 1
+                                    border.color: root.colorHex === modelData ? root.bar.foreground : Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.15)
+                                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.setPresetColor(modelData) }
+                                }
+                            }
+                        }
+                    }
+                    // LED Brightness
+                    Column { width: parent.width; spacing: Style.space(4)
+                        Text { text: "LED Brightness"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+                        Row { width: parent.width; spacing: Style.space(4)
+                            Repeater { model: ["off", "low", "med", "high"]
+                                Button { required property var modelData; width: (parent.width - Style.space(4) * 3) / 4; text: modelData.charAt(0).toUpperCase() + modelData.slice(1); tooltipText: modelData === "off" ? "Turn the keyboard backlight off entirely." : "Set keyboard backlight brightness to " + modelData + "."; fontSize: Style.font.caption; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; active: root.ledBrightness === modelData; onClicked: root.setLedBrightness(modelData) }
+                            }
+                        }
+                    }
+
+                    // Power states — G-Helper's "keyboard lighting on
+                    // boot/sleep/awake". asusctl exposes these as one call, so
+                    // each toggle resends the whole set (see applyLedPower).
+                    Column { width: parent.width; spacing: Style.space(4)
+                        PanelSeparator { foreground: root.bar.foreground }
+                        Text { text: "Lighting active while"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+                        Row { width: parent.width; spacing: Style.space(4)
+                            Button { width: (parent.width - Style.space(4) * 2) / 3; text: "Awake"; tooltipText: "Keep the keyboard lit while the laptop is in normal use."; fontSize: Style.font.caption; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; active: root.ledAwake; onClicked: root.setLedPower(!root.ledAwake) }
+                            Button { width: (parent.width - Style.space(4) * 2) / 3; text: "Boot"; tooltipText: "Play the lighting animation during power-on and shutdown."; fontSize: Style.font.caption; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; active: root.ledBoot; onClicked: root.setLedBoot(!root.ledBoot) }
+                            Button { width: (parent.width - Style.space(4) * 2) / 3; text: "Sleep"; tooltipText: "Keep a breathing light going while the laptop is suspended."; fontSize: Style.font.caption; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; active: root.ledSleep; onClicked: root.setLedSleep(!root.ledSleep) }
+                        }
+                        Text { width: parent.width; text: "asusctl does not report these back, so they show what this panel last set."; wrapMode: Text.WordWrap; color: Qt.darker(root.bar.foreground, 1.6); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption }
+                    }
+                }
+
+                // ============================================================= FAN TAB
+                Column { visible: root.tabKey === "fan"; width: parent.width; spacing: Style.space(10)
+
+                    Row { width: parent.width
+                        Text { text: "CUSTOM FAN CURVES"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.subtitle; font.bold: true; anchors.verticalCenter: parent.verticalCenter; width: parent.width - masterSw.width - resetAllBtn.width - Style.space(16) }
+                        Rectangle { id: masterSw; width: Style.space(48); height: Style.space(20); radius: Style.space(10); anchors.verticalCenter: parent.verticalCenter; color: root.fanCurveEnabled ? Qt.rgba(0.27, 0.8, 0.27, 0.3) : Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08)
+                            MouseArea { id: masterSwMouse; anchors.fill: parent; hoverEnabled: true; enabled: root.profileLoaded; cursorShape: Qt.PointingHandCursor; onClicked: root.toggleFanCurves() }
+                            PanelToolTip { visible: masterSwMouse.containsMouse; text: "Master switch for custom fan curves.\nOff means the firmware's own curves run instead." }
+                            Text { text: root.fanCurveEnabled ? "ON" : "OFF"; color: root.fanCurveEnabled ? "#44cc44" : Qt.darker(root.bar.foreground, 1.6); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; anchors.centerIn: parent }
+                        }
+                        Button { id: resetAllBtn; text: "Reset all"; tooltipText: "Restore the firmware's default fan curves\nfor the profile selected below."; fontSize: Style.font.caption; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; anchors.verticalCenter: parent.verticalCenter; anchors.leftMargin: Style.space(6); onClicked: root.resetFanCurves() }
+                    }
+                    Text { visible: !root.fanCurveEnabled; width: parent.width; text: "Turn this on to enable per-fan custom curves below."; wrapMode: Text.WordWrap; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption }
+
+                    // Curves are stored per power profile. Editing whichever
+                    // profile is active is rarely what you want when tuning,
+                    // so the target is picked explicitly here.
+                    Column { width: parent.width; spacing: Style.space(4)
+                        Text { text: "Editing curves for"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+                        Row { id: fpRow; width: parent.width; spacing: Style.space(4); readonly property real cw: root.profiles.length > 0 ? (width - spacing * (root.profiles.length - 1)) / root.profiles.length : 0
+                            Repeater { model: root.profiles
+                                Button { required property var modelData; width: fpRow.cw; text: String(modelData) + (root.currentProfile === modelData ? " •" : ""); tooltipText: "Edit the fan curves stored for the " + modelData + " profile." + (root.currentProfile === modelData ? "\nThis is the profile currently active (•)." : "\nChanges apply when you switch to that profile."); fontSize: Style.font.caption; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; active: root.fanProfile === modelData; onClicked: root.selectFanProfile(String(modelData)) }
+                            }
+                        }
+                    }
+
+                    // CPU Fan
+                    Column { width: parent.width; spacing: Style.space(4); opacity: root.fanCurveEnabled ? 1 : 0.5
+                        Row { width: parent.width; spacing: Style.space(8)
+                            Rectangle { width: Style.space(12); height: Style.space(12); radius: Style.space(6); color: root.cpuFanEnabled ? "#44cc44" : "#666"; anchors.verticalCenter: parent.verticalCenter }
+                            Text { text: "CPU Fan"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true; anchors.verticalCenter: parent.verticalCenter }
+                            Text { text: Model.fmtRpm(root.sensors.fanCpu) + "   " + Model.fmtTemp(root.sensors.cpuTemp); color: Qt.darker(root.bar.foreground, 1.5); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; anchors.verticalCenter: parent.verticalCenter; horizontalAlignment: Text.AlignRight; width: parent.width - Style.space(12) - Style.space(48) - Style.space(70) }
+                            Rectangle { width: Style.space(48); height: Style.space(20); radius: Style.space(10); color: root.cpuFanEnabled ? Qt.rgba(0.27, 0.8, 0.27, 0.3) : Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08); anchors.verticalCenter: parent.verticalCenter
+                                MouseArea { id: cpuSwMouse; anchors.fill: parent; hoverEnabled: true; enabled: root.fanCurveEnabled; cursorShape: Qt.PointingHandCursor; onClicked: root.toggleCpuFan() }
+                                PanelToolTip { visible: cpuSwMouse.containsMouse; text: "Use the custom curve below for the CPU fan." }
+                                Text { text: root.cpuFanEnabled ? "ON" : "OFF"; color: root.cpuFanEnabled ? "#44cc44" : Qt.darker(root.bar.foreground, 1.6); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; anchors.centerIn: parent }
+                            }
+                        }
+                        FanCurveEditor {
+                            width: parent.width
+                            points: root.cpuFanPoints
+                            enabledState: root.cpuFanEnabled
+                            interactive: root.fanCurveEnabled
+                            accent: "#44cc44"
+                            foreground: root.bar.foreground
+                            fontFamily: root.bar.fontFamily
+                            onCommit: function(pts) { root.cpuFanPoints = pts; root.applyFanCurve("cpu", pts) }
+                            onReset: root.resetFanCurves()
+                        }
+                    }
+                    // GPU Fan
+                    Column { width: parent.width; spacing: Style.space(4); opacity: root.fanCurveEnabled ? 1 : 0.5
+                        Row { width: parent.width; spacing: Style.space(8)
+                            Rectangle { width: Style.space(12); height: Style.space(12); radius: Style.space(6); color: root.gpuFanEnabled ? "#4488ff" : "#666"; anchors.verticalCenter: parent.verticalCenter }
+                            Text { text: "GPU Fan"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true; anchors.verticalCenter: parent.verticalCenter }
+                            Text { text: Model.fmtRpm(root.sensors.fanGpu) + (root.sensors.gpuTemp >= 0 ? "   " + Model.fmtTemp(root.sensors.gpuTemp) : ""); color: Qt.darker(root.bar.foreground, 1.5); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; anchors.verticalCenter: parent.verticalCenter; horizontalAlignment: Text.AlignRight; width: parent.width - Style.space(12) - Style.space(48) - Style.space(70) }
+                            Rectangle { width: Style.space(48); height: Style.space(20); radius: Style.space(10); color: root.gpuFanEnabled ? Qt.rgba(0.27, 0.53, 1, 0.3) : Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08); anchors.verticalCenter: parent.verticalCenter
+                                MouseArea { id: gpuSwMouse; anchors.fill: parent; hoverEnabled: true; enabled: root.fanCurveEnabled; cursorShape: Qt.PointingHandCursor; onClicked: root.toggleGpuFan() }
+                                PanelToolTip { visible: gpuSwMouse.containsMouse; text: "Use the custom curve below for the GPU fan." }
+                                Text { text: root.gpuFanEnabled ? "ON" : "OFF"; color: root.gpuFanEnabled ? "#4488ff" : Qt.darker(root.bar.foreground, 1.6); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; anchors.centerIn: parent }
+                            }
+                        }
+                        FanCurveEditor {
+                            width: parent.width
+                            points: root.gpuFanPoints
+                            enabledState: root.gpuFanEnabled
+                            interactive: root.fanCurveEnabled
+                            accent: "#4488ff"
+                            foreground: root.bar.foreground
+                            fontFamily: root.bar.fontFamily
+                            onCommit: function(pts) { root.gpuFanPoints = pts; root.applyFanCurve("gpu", pts) }
+                            onReset: root.resetFanCurves()
+                        }
+                    }
+                    // Mid Fan — only laptops with a third fan report this.
+                    Column { visible: root.hasMidFan; width: parent.width; spacing: Style.space(4); opacity: root.fanCurveEnabled ? 1 : 0.5
+                        Row { width: parent.width; spacing: Style.space(8)
+                            Rectangle { width: Style.space(12); height: Style.space(12); radius: Style.space(6); color: root.midFanEnabled ? "#cc9944" : "#666"; anchors.verticalCenter: parent.verticalCenter }
+                            Text { text: "Mid Fan"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true; anchors.verticalCenter: parent.verticalCenter; width: parent.width - Style.space(60) }
+                            Rectangle { width: Style.space(48); height: Style.space(20); radius: Style.space(10); color: root.midFanEnabled ? Qt.rgba(0.8, 0.6, 0.27, 0.3) : Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08); anchors.verticalCenter: parent.verticalCenter
+                                MouseArea { id: midSwMouse; anchors.fill: parent; hoverEnabled: true; enabled: root.fanCurveEnabled; cursorShape: Qt.PointingHandCursor; onClicked: root.toggleMidFan() }
+                                PanelToolTip { visible: midSwMouse.containsMouse; text: "Use the custom curve below for the middle fan." }
+                                Text { text: root.midFanEnabled ? "ON" : "OFF"; color: root.midFanEnabled ? "#cc9944" : Qt.darker(root.bar.foreground, 1.6); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; anchors.centerIn: parent }
+                            }
+                        }
+                        FanCurveEditor {
+                            width: parent.width
+                            points: root.midFanPoints
+                            enabledState: root.midFanEnabled
+                            interactive: root.fanCurveEnabled
+                            accent: "#cc9944"
+                            foreground: root.bar.foreground
+                            fontFamily: root.bar.fontFamily
+                            onCommit: function(pts) { root.midFanPoints = pts; root.applyFanCurve("mid", pts) }
+                            onReset: root.resetFanCurves()
+                        }
+                    }
+                }
+
+                // ======================================================== ADVANCED TAB
+                Column { visible: root.tabKey === "advanced"; width: parent.width; spacing: Style.space(8)
+                    Row { width: parent.width
+                        Text { width: parent.width - defaultsBtn.width - Style.space(8); text: "Firmware power limits. Only the controls this laptop actually reports are shown."; wrapMode: Text.WordWrap; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; anchors.verticalCenter: parent.verticalCenter }
+                        Button { id: defaultsBtn; text: "Defaults"; tooltipText: "Put every power limit below back to the value\nthe firmware reports as its default."; fontSize: Style.font.caption; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; anchors.verticalCenter: parent.verticalCenter; onClicked: root.restorePowerDefaults() }
+                    }
+                    Column { visible: root.armourySupported.pptPl1 || root.armourySupported.pptPl2; width: parent.width; spacing: Style.space(4)
+                        Text { text: "CPU Power"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+                        Row { visible: root.armourySupported.pptPl1; width: parent.width; spacing: Style.space(4)
+                            Text { text: "PL1"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(40); anchors.verticalCenter: parent.verticalCenter
+                                MouseArea { id: pl1Help; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
+                                PanelToolTip { visible: pl1Help.containsMouse; text: Model.armouryTips.ppt_pl1_spl }
+                            }
+                            PanelSlider { width: parent.width - Style.space(40) - Style.space(32) - Style.space(4) * 2; bar: root.bar; minimum: root.pptPl1Min; maximum: root.pptPl1Max; step: 1; integer: true; value: root.pptPl1; onReleased: function(v) { root.setPptPl1(v) } }
+                            Text { text: root.pptPl1 + "W"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(32); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
+                        }
+                        Row { visible: root.armourySupported.pptPl2; width: parent.width; spacing: Style.space(4)
+                            Text { text: "PL2"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(40); anchors.verticalCenter: parent.verticalCenter
+                                MouseArea { id: pl2Help; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
+                                PanelToolTip { visible: pl2Help.containsMouse; text: Model.armouryTips.ppt_pl2_sppt }
+                            }
+                            PanelSlider { width: parent.width - Style.space(40) - Style.space(32) - Style.space(4) * 2; bar: root.bar; minimum: root.pptPl2Min; maximum: root.pptPl2Max; step: 1; integer: true; value: root.pptPl2; onReleased: function(v) { root.setPptPl2(v) } }
+                            Text { text: root.pptPl2 + "W"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(32); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
+                        }
+                    }
+                    Column { visible: root.armourySupported.nvDynBoost || root.armourySupported.nvTempTarget; width: parent.width; spacing: Style.space(4)
+                        Text { text: "GPU Power"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+                        Row { visible: root.armourySupported.nvDynBoost; width: parent.width; spacing: Style.space(4)
+                            Text { text: "Boost"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(40); anchors.verticalCenter: parent.verticalCenter
+                                MouseArea { id: boostHelp; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
+                                PanelToolTip { visible: boostHelp.containsMouse; text: Model.armouryTips.nv_dynamic_boost }
+                            }
+                            PanelSlider { width: parent.width - Style.space(40) - Style.space(32) - Style.space(4) * 2; bar: root.bar; minimum: root.nvDynBoostMin; maximum: root.nvDynBoostMax; step: 1; integer: true; value: root.nvDynBoost; onReleased: function(v) { root.setNvDynBoost(v) } }
+                            Text { text: root.nvDynBoost + "W"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(32); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
+                        }
+                        Row { visible: root.armourySupported.nvTempTarget; width: parent.width; spacing: Style.space(4)
+                            Text { text: "Temp"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(40); anchors.verticalCenter: parent.verticalCenter
+                                MouseArea { id: tempHelp; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
+                                PanelToolTip { visible: tempHelp.containsMouse; text: Model.armouryTips.nv_temp_target }
+                            }
+                            PanelSlider { width: parent.width - Style.space(40) - Style.space(32) - Style.space(4) * 2; bar: root.bar; minimum: root.nvTempTargetMin; maximum: root.nvTempTargetMax; step: 1; integer: true; value: root.nvTempTarget; onReleased: function(v) { root.setNvTempTarget(v) } }
+                            Text { text: root.nvTempTarget + "°C"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(32); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
+                        }
+                    }
+                }
             }
         }
 
@@ -338,279 +910,9 @@ Panel {
         }
     }
 
-    // ============================================================ MAIN TAB
-    Component {
-        id: mainTab
-        Column { width: parent.width; spacing: Style.space(12)
-
-            Column { width: parent.width; spacing: Style.space(8)
-                PanelSectionHeader { text: "POWER PROFILE"; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily }
-                Row { id: pRow; width: parent.width; spacing: Style.space(4); readonly property real cw: root.profiles.length > 0 ? (width - spacing * (root.profiles.length - 1)) / root.profiles.length : 0
-                    Repeater { model: root.profiles
-                        Button { required property var modelData; required property int index; width: pRow.cw; iconText: Model.profileIcon(String(modelData)); iconSize: Style.font.title; text: String(modelData); fontSize: Style.font.bodySmall; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; active: root.currentProfile === modelData; hasCursor: root.cursorActive && root.profileIndex === index; onClicked: root.setProfile(modelData); onHovered: function(h) { if (h) { root.cursorActive = true; root.profileIndex = index } } }
-                    }
-                }
-            }
-
-            Column { visible: root.supported.hasBattery && root.showBatteryLimit; width: parent.width; spacing: Style.space(8)
-                PanelSeparator { foreground: root.bar.foreground }
-                PanelSectionHeader { text: "BATTERY CHARGE LIMIT"; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily }
-                Row { width: parent.width; spacing: Style.space(4)
-                    PanelSlider { width: parent.width - Style.space(32); bar: root.bar; minimum: 20; maximum: 100; step: 5; integer: true; value: root.batteryLimit; tickCount: 9; onReleased: function(v) { root.setBatteryLimit(Math.round(v)) } }
-                    Text { text: root.batteryLimit + "%"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.body; font.bold: true; width: Style.space(32); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
-                }
-                Row { width: parent.width; spacing: Style.space(4)
-                    Repeater { model: [20, 40, 60, 80, 100]
-                        Button { required property var modelData; width: (parent.width - Style.space(4) * 4) / 5; text: modelData + "%"; fontSize: Style.font.caption; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; active: root.batteryLimit === modelData; onClicked: root.setBatteryLimit(modelData) }
-                    }
-                }
-            }
-        }
-    }
-
-    // ============================================================= RGB TAB
-    Component {
-        id: rgbTab
-        Column { width: parent.width; spacing: Style.space(8)
-            // Header with LED toggle
-            Row { width: parent.width
-                Text { text: "KEYBOARD RGB"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.subtitle; font.bold: true; anchors.verticalCenter: parent.verticalCenter; width: parent.width - ledSw.width - Style.space(8) }
-                Row { id: ledSw; spacing: Style.space(4); anchors.verticalCenter: parent.verticalCenter
-                    Rectangle { width: Style.space(14); height: Style.space(14); radius: Style.space(7); color: root.ledAwake ? "#44cc44" : "#cc4444"; anchors.verticalCenter: parent.verticalCenter
-                        SequentialAnimation on opacity { running: root.ledAwake; loops: Animation.Infinite; NumberAnimation { from: 1; to: 0.5; duration: 800 } NumberAnimation { from: 0.5; to: 1; duration: 800 } }
-                    }
-                    Text { text: root.ledAwake ? "ON" : "OFF"; color: root.ledAwake ? "#44cc44" : "#cc4444"; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; anchors.verticalCenter: parent.verticalCenter }
-                    MouseArea { width: Style.space(40); height: Style.space(20); anchors.verticalCenter: parent.verticalCenter; cursorShape: Qt.PointingHandCursor; onClicked: root.setLedPower(!root.ledAwake) }
-                }
-            }
-            // Effect grid — only modes this laptop's asusctl actually reports supporting.
-            Grid { width: parent.width; columns: 3; spacing: Style.space(3)
-                Repeater { model: root.auraSupportedEffects
-                    Rectangle { required property var modelData; width: (parent.width - Style.space(3) * 2) / 3; height: Style.space(40); radius: Style.cornerRadius; color: root.currentEffect === modelData.id ? Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.2) : Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.06); border.width: root.currentEffect === modelData.id ? 2 : 1; border.color: root.currentEffect === modelData.id ? root.bar.foreground : "transparent"
-                        Row { anchors.centerIn: parent; spacing: Style.space(4)
-                            Text { text: modelData.icon; color: root.currentEffect === modelData.id ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.body }
-                            Text { text: modelData.name; color: root.currentEffect === modelData.id ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.6); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; anchors.verticalCenter: parent.verticalCenter }
-                        }
-                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.selectEffect(modelData.id) }
-                    }
-                }
-            }
-            // Effect params
-            Column { visible: root.needsColor || root.needsColor2 || root.needsSpeed || root.needsDirection; width: parent.width; spacing: Style.space(6)
-                Column { visible: root.needsColor; width: parent.width; spacing: Style.space(4)
-                    Row { width: parent.width; spacing: Style.space(6)
-                        Rectangle { width: Style.space(20); height: Style.space(20); radius: Style.space(10); color: root.liveColor; border.width: 1; border.color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.3); anchors.verticalCenter: parent.verticalCenter }
-                        Text { text: "Color  #" + root.colorHex.toUpperCase(); color: root.bar.foreground; font.family: "monospace"; font.pixelSize: Style.font.caption; anchors.verticalCenter: parent.verticalCenter }
-                        Item { width: parent.width - Style.space(20) - Style.space(60) - Style.space(6) * 2; height: 1 }
-                        Button { text: "Set"; fontSize: Style.font.caption; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; active: true; anchors.verticalCenter: parent.verticalCenter; onClicked: root.applyEffect() }
-                    }
-                    Row { width: parent.width; spacing: Style.space(4)
-                        Text { text: "R"; color: "#ff4444"; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(12); anchors.verticalCenter: parent.verticalCenter }
-                        PanelSlider { width: parent.width - Style.space(12) - Style.space(24) - Style.space(4) * 2; bar: root.bar; minimum: 0; maximum: 255; step: 1; integer: true; value: root.colorR; fillColor: Qt.rgba(1, 0.2, 0.2, 1); knobColor: Qt.rgba(1, 0.3, 0.3, 1); onReleased: function(v) { root.colorR = Math.round(v) } }
-                        Text { text: root.colorR; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(24); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
-                    }
-                    Row { width: parent.width; spacing: Style.space(4)
-                        Text { text: "G"; color: "#44cc44"; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(12); anchors.verticalCenter: parent.verticalCenter }
-                        PanelSlider { width: parent.width - Style.space(12) - Style.space(24) - Style.space(4) * 2; bar: root.bar; minimum: 0; maximum: 255; step: 1; integer: true; value: root.colorG; fillColor: Qt.rgba(0.2, 1, 0.2, 1); knobColor: Qt.rgba(0.3, 1, 0.3, 1); onReleased: function(v) { root.colorG = Math.round(v) } }
-                        Text { text: root.colorG; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(24); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
-                    }
-                    Row { width: parent.width; spacing: Style.space(4)
-                        Text { text: "B"; color: "#4488ff"; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(12); anchors.verticalCenter: parent.verticalCenter }
-                        PanelSlider { width: parent.width - Style.space(12) - Style.space(24) - Style.space(4) * 2; bar: root.bar; minimum: 0; maximum: 255; step: 1; integer: true; value: root.colorB; fillColor: Qt.rgba(0.2, 0.2, 1, 1); knobColor: Qt.rgba(0.3, 0.3, 1, 1); onReleased: function(v) { root.colorB = Math.round(v) } }
-                        Text { text: root.colorB; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(24); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
-                    }
-                }
-                Column { visible: root.needsColor2; width: parent.width; spacing: Style.space(4)
-                    Row { width: parent.width; spacing: Style.space(6)
-                        Rectangle { width: Style.space(20); height: Style.space(20); radius: Style.space(10); color: root.liveColor2; border.width: 1; border.color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.3); anchors.verticalCenter: parent.verticalCenter }
-                        Text { text: "Color 2  #" + root.color2Hex.toUpperCase(); color: root.bar.foreground; font.family: "monospace"; font.pixelSize: Style.font.caption; anchors.verticalCenter: parent.verticalCenter }
-                    }
-                    Row { width: parent.width; spacing: Style.space(4)
-                        Text { text: "R"; color: "#ff4444"; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(12); anchors.verticalCenter: parent.verticalCenter }
-                        PanelSlider { width: parent.width - Style.space(12) - Style.space(24) - Style.space(4) * 2; bar: root.bar; minimum: 0; maximum: 255; step: 1; integer: true; value: root.color2R; fillColor: Qt.rgba(1, 0.2, 0.2, 1); knobColor: Qt.rgba(1, 0.3, 0.3, 1); onReleased: function(v) { root.color2R = Math.round(v) } }
-                        Text { text: root.color2R; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(24); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
-                    }
-                    Row { width: parent.width; spacing: Style.space(4)
-                        Text { text: "G"; color: "#44cc44"; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(12); anchors.verticalCenter: parent.verticalCenter }
-                        PanelSlider { width: parent.width - Style.space(12) - Style.space(24) - Style.space(4) * 2; bar: root.bar; minimum: 0; maximum: 255; step: 1; integer: true; value: root.color2G; fillColor: Qt.rgba(0.2, 1, 0.2, 1); knobColor: Qt.rgba(0.3, 1, 0.3, 1); onReleased: function(v) { root.color2G = Math.round(v) } }
-                        Text { text: root.color2G; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(24); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
-                    }
-                    Row { width: parent.width; spacing: Style.space(4)
-                        Text { text: "B"; color: "#4488ff"; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(12); anchors.verticalCenter: parent.verticalCenter }
-                        PanelSlider { width: parent.width - Style.space(12) - Style.space(24) - Style.space(4) * 2; bar: root.bar; minimum: 0; maximum: 255; step: 1; integer: true; value: root.color2B; fillColor: Qt.rgba(0.2, 0.2, 1, 1); knobColor: Qt.rgba(0.3, 0.3, 1, 1); onReleased: function(v) { root.color2B = Math.round(v) } }
-                        Text { text: root.color2B; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(24); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
-                    }
-                }
-                Row { visible: root.needsSpeed; width: parent.width; spacing: Style.space(4)
-                    Text { text: "Speed"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; anchors.verticalCenter: parent.verticalCenter; width: Style.space(40) }
-                    Repeater { model: Model.speeds
-                        Button { required property var modelData; width: (parent.width - Style.space(40) - Style.space(4) * 2) / 3; text: Model.speedLabels[modelData]; fontSize: Style.font.caption; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; active: root.currentSpeed === modelData; onClicked: { root.currentSpeed = modelData; root.applyEffect() } }
-                    }
-                }
-                Row { visible: root.needsDirection; width: parent.width; spacing: Style.space(4)
-                    Text { text: "Dir"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; anchors.verticalCenter: parent.verticalCenter; width: Style.space(40) }
-                    Repeater { model: Model.directions
-                        Button { required property var modelData; width: (parent.width - Style.space(40) - Style.space(4) * 3) / 4; text: modelData.charAt(0).toUpperCase() + modelData.slice(1); fontSize: Style.font.caption; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; active: root.currentDirection === modelData; onClicked: { root.currentDirection = modelData; root.applyEffect() } }
-                    }
-                }
-                Grid { visible: root.needsColor; width: parent.width; columns: 6; spacing: Style.space(3)
-                    Repeater {
-                        model: ["ff0000", "ff8800", "ffff00", "00ff00", "00ffff", "0088ff", "aa00ff", "ff00ff", "ffffff", "ffaa44", "44ccff", "88ff00"]
-                        Rectangle {
-                            required property string modelData
-                            property color swatchColor: Qt.rgba(
-                                parseInt(modelData.substring(0, 2), 16) / 255,
-                                parseInt(modelData.substring(2, 4), 16) / 255,
-                                parseInt(modelData.substring(4, 6), 16) / 255,
-                                1
-                            )
-                            width: (parent.width - Style.space(3) * 5) / 6
-                            height: Style.space(22)
-                            radius: Style.space(4)
-                            color: swatchColor
-                            border.width: root.colorHex === modelData ? 2 : 1
-                            border.color: root.colorHex === modelData ? root.bar.foreground : Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.15)
-                            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.setPresetColor(modelData) }
-                        }
-                    }
-                }
-            }
-            // LED Brightness
-            Column { width: parent.width; spacing: Style.space(4)
-                Text { text: "LED Brightness"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
-                Row { width: parent.width; spacing: Style.space(4)
-                    Repeater { model: ["off", "low", "med", "high"]
-                        Button { required property var modelData; width: (parent.width - Style.space(4) * 3) / 4; text: modelData.charAt(0).toUpperCase() + modelData.slice(1); fontSize: Style.font.caption; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; active: root.ledBrightness === modelData; onClicked: root.setLedBrightness(modelData) }
-                    }
-                }
-            }
-        }
-    }
-
-    // ============================================================= FAN TAB
-    Component {
-        id: fanTab
-        Column { width: parent.width; spacing: Style.space(10)
-
-            Row { width: parent.width
-                Text { text: "CUSTOM FAN CURVES"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.subtitle; font.bold: true; anchors.verticalCenter: parent.verticalCenter; width: parent.width - masterSw.width - resetAllBtn.width - Style.space(16) }
-                Rectangle { id: masterSw; width: Style.space(48); height: Style.space(20); radius: Style.space(10); anchors.verticalCenter: parent.verticalCenter; color: root.fanCurveEnabled ? Qt.rgba(0.27, 0.8, 0.27, 0.3) : Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08)
-                    MouseArea { anchors.fill: parent; enabled: root.profileLoaded; cursorShape: Qt.PointingHandCursor; onClicked: root.toggleFanCurves() }
-                    Text { text: root.fanCurveEnabled ? "ON" : "OFF"; color: root.fanCurveEnabled ? "#44cc44" : Qt.darker(root.bar.foreground, 1.6); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; anchors.centerIn: parent }
-                }
-                Button { id: resetAllBtn; text: "Reset all"; fontSize: Style.font.caption; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; horizontalPadding: Style.spacing.controlPaddingX; verticalPadding: Style.spacing.controlPaddingY; bordered: true; anchors.verticalCenter: parent.verticalCenter; anchors.leftMargin: Style.space(6); onClicked: root.resetFanCurves() }
-            }
-            Text { visible: !root.fanCurveEnabled; width: parent.width; text: "Turn this on to enable per-fan custom curves below."; wrapMode: Text.WordWrap; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption }
-
-            // CPU Fan
-            Column { width: parent.width; spacing: Style.space(4); opacity: root.fanCurveEnabled ? 1 : 0.5
-                Row { width: parent.width; spacing: Style.space(8)
-                    Rectangle { width: Style.space(12); height: Style.space(12); radius: Style.space(6); color: root.cpuFanEnabled ? "#44cc44" : "#666"; anchors.verticalCenter: parent.verticalCenter }
-                    Text { text: "CPU Fan"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true; anchors.verticalCenter: parent.verticalCenter; width: parent.width - Style.space(60) }
-                    Rectangle { width: Style.space(48); height: Style.space(20); radius: Style.space(10); color: root.cpuFanEnabled ? Qt.rgba(0.27, 0.8, 0.27, 0.3) : Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08); anchors.verticalCenter: parent.verticalCenter
-                        MouseArea { anchors.fill: parent; enabled: root.fanCurveEnabled; cursorShape: Qt.PointingHandCursor; onClicked: root.toggleCpuFan() }
-                        Text { text: root.cpuFanEnabled ? "ON" : "OFF"; color: root.cpuFanEnabled ? "#44cc44" : Qt.darker(root.bar.foreground, 1.6); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; anchors.centerIn: parent }
-                    }
-                }
-                FanCurveEditor {
-                    width: parent.width
-                    points: root.cpuFanPoints
-                    enabledState: root.cpuFanEnabled
-                    interactive: root.fanCurveEnabled
-                    accent: "#44cc44"
-                    foreground: root.bar.foreground
-                    fontFamily: root.bar.fontFamily
-                    onCommit: function(pts) { root.cpuFanPoints = pts; root.applyFanCurve("cpu", pts) }
-                    onReset: root.resetFanCurves()
-                }
-            }
-            // GPU Fan
-            Column { width: parent.width; spacing: Style.space(4); opacity: root.fanCurveEnabled ? 1 : 0.5
-                Row { width: parent.width; spacing: Style.space(8)
-                    Rectangle { width: Style.space(12); height: Style.space(12); radius: Style.space(6); color: root.gpuFanEnabled ? "#4488ff" : "#666"; anchors.verticalCenter: parent.verticalCenter }
-                    Text { text: "GPU Fan"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true; anchors.verticalCenter: parent.verticalCenter; width: parent.width - Style.space(60) }
-                    Rectangle { width: Style.space(48); height: Style.space(20); radius: Style.space(10); color: root.gpuFanEnabled ? Qt.rgba(0.27, 0.53, 1, 0.3) : Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08); anchors.verticalCenter: parent.verticalCenter
-                        MouseArea { anchors.fill: parent; enabled: root.fanCurveEnabled; cursorShape: Qt.PointingHandCursor; onClicked: root.toggleGpuFan() }
-                        Text { text: root.gpuFanEnabled ? "ON" : "OFF"; color: root.gpuFanEnabled ? "#4488ff" : Qt.darker(root.bar.foreground, 1.6); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; anchors.centerIn: parent }
-                    }
-                }
-                FanCurveEditor {
-                    width: parent.width
-                    points: root.gpuFanPoints
-                    enabledState: root.gpuFanEnabled
-                    interactive: root.fanCurveEnabled
-                    accent: "#4488ff"
-                    foreground: root.bar.foreground
-                    fontFamily: root.bar.fontFamily
-                    onCommit: function(pts) { root.gpuFanPoints = pts; root.applyFanCurve("gpu", pts) }
-                    onReset: root.resetFanCurves()
-                }
-            }
-            // Mid Fan — only laptops with a third fan report this.
-            Column { visible: root.hasMidFan; width: parent.width; spacing: Style.space(4); opacity: root.fanCurveEnabled ? 1 : 0.5
-                Row { width: parent.width; spacing: Style.space(8)
-                    Rectangle { width: Style.space(12); height: Style.space(12); radius: Style.space(6); color: root.midFanEnabled ? "#cc9944" : "#666"; anchors.verticalCenter: parent.verticalCenter }
-                    Text { text: "Mid Fan"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true; anchors.verticalCenter: parent.verticalCenter; width: parent.width - Style.space(60) }
-                    Rectangle { width: Style.space(48); height: Style.space(20); radius: Style.space(10); color: root.midFanEnabled ? Qt.rgba(0.8, 0.6, 0.27, 0.3) : Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08); anchors.verticalCenter: parent.verticalCenter
-                        MouseArea { anchors.fill: parent; enabled: root.fanCurveEnabled; cursorShape: Qt.PointingHandCursor; onClicked: root.toggleMidFan() }
-                        Text { text: root.midFanEnabled ? "ON" : "OFF"; color: root.midFanEnabled ? "#cc9944" : Qt.darker(root.bar.foreground, 1.6); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; anchors.centerIn: parent }
-                    }
-                }
-                FanCurveEditor {
-                    width: parent.width
-                    points: root.midFanPoints
-                    enabledState: root.midFanEnabled
-                    interactive: root.fanCurveEnabled
-                    accent: "#cc9944"
-                    foreground: root.bar.foreground
-                    fontFamily: root.bar.fontFamily
-                    onCommit: function(pts) { root.midFanPoints = pts; root.applyFanCurve("mid", pts) }
-                    onReset: root.resetFanCurves()
-                }
-            }
-        }
-    }
-
-    // ======================================================== ADVANCED TAB
-    Component {
-        id: advancedTab
-        Column { width: parent.width; spacing: Style.space(8)
-            Text { width: parent.width; text: "Firmware limits. Only the controls this laptop actually reports are shown."; wrapMode: Text.WordWrap; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption }
-            Toggle { visible: root.armourySupported.panelOverdrive; width: parent.width; label: "Panel Overdrive"; description: "Faster display response"; checked: root.panelOverdrive; foreground: root.bar.foreground; accent: Color.accent; fontFamily: root.bar.fontFamily; onClicked: root.togglePanelOverdrive() }
-            Toggle { visible: root.armourySupported.gpuMux; width: parent.width; label: "GPU MUX Switch"; description: root.gpuMux ? "dGPU only" : "Hybrid (Optimus)"; checked: root.gpuMux; foreground: root.bar.foreground; accent: Color.accent; fontFamily: root.bar.fontFamily; onClicked: root.toggleGpuMux() }
-            Toggle { visible: root.armourySupported.dgpuDisable; width: parent.width; label: "Disable dGPU"; description: "Turn off discrete GPU"; checked: root.dgpuDisable; foreground: root.bar.foreground; accent: Color.accent; fontFamily: root.bar.fontFamily; onClicked: root.toggleDgpuDisable() }
-            Column { visible: root.armourySupported.pptPl1 || root.armourySupported.pptPl2; width: parent.width; spacing: Style.space(4)
-                Text { text: "CPU Power"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
-                Row { visible: root.armourySupported.pptPl1; width: parent.width; spacing: Style.space(4)
-                    Text { text: "PL1"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(24); anchors.verticalCenter: parent.verticalCenter }
-                    PanelSlider { width: parent.width - Style.space(24) - Style.space(32) - Style.space(4) * 2; bar: root.bar; minimum: root.pptPl1Min; maximum: root.pptPl1Max; step: 1; integer: true; value: root.pptPl1; onReleased: function(v) { root.setPptPl1(v) } }
-                    Text { text: root.pptPl1 + "W"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(32); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
-                }
-                Row { visible: root.armourySupported.pptPl2; width: parent.width; spacing: Style.space(4)
-                    Text { text: "PL2"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(24); anchors.verticalCenter: parent.verticalCenter }
-                    PanelSlider { width: parent.width - Style.space(24) - Style.space(32) - Style.space(4) * 2; bar: root.bar; minimum: root.pptPl2Min; maximum: root.pptPl2Max; step: 1; integer: true; value: root.pptPl2; onReleased: function(v) { root.setPptPl2(v) } }
-                    Text { text: root.pptPl2 + "W"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(32); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
-                }
-            }
-            Column { visible: root.armourySupported.nvDynBoost || root.armourySupported.nvTempTarget; width: parent.width; spacing: Style.space(4)
-                Text { text: "GPU Power"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
-                Row { visible: root.armourySupported.nvDynBoost; width: parent.width; spacing: Style.space(4)
-                    Text { text: "Boost"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(24); anchors.verticalCenter: parent.verticalCenter }
-                    PanelSlider { width: parent.width - Style.space(24) - Style.space(32) - Style.space(4) * 2; bar: root.bar; minimum: 0; maximum: 25; step: 1; integer: true; value: root.nvDynBoost; onReleased: function(v) { root.setNvDynBoost(v) } }
-                    Text { text: root.nvDynBoost + "W"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(32); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
-                }
-                Row { visible: root.armourySupported.nvTempTarget; width: parent.width; spacing: Style.space(4)
-                    Text { text: "Temp"; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; width: Style.space(24); anchors.verticalCenter: parent.verticalCenter }
-                    PanelSlider { width: parent.width - Style.space(24) - Style.space(32) - Style.space(4) * 2; bar: root.bar; minimum: 75; maximum: 87; step: 1; integer: true; value: root.nvTempTarget; onReleased: function(v) { root.setNvTempTarget(v) } }
-                    Text { text: root.nvTempTarget + "°C"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(32); horizontalAlignment: Text.AlignRight; anchors.verticalCenter: parent.verticalCenter }
-                }
-            }
-        }
-    }
-
     IpcHandler { target: "io.github.moneytosms.asus"; function open() { root.open() } function close() { root.close() } function show() { root.open() } function hide() { root.close() } function toggle() { root.toggle() } function refresh() { root.refresh() } }
     onOpenedChanged: { if (opened) { Qt.callLater(refresh); cursorActive = false } }
-    Component.onCompleted: { checkAsusctl.running = true }
+    Component.onCompleted: { checkAsusctl.running = true; checkHyprmoncfg.running = true }
 
     Process { id: checkAsusctl; command: ["which", "asusctl"]; onExited: function(ec) { root.asusctlAvailable = ec === 0; if (root.asusctlAvailable) refresh() } }
     Process { id: profileProc; command: ["asusctl", "profile", "get"]; stdout: StdioCollector { waitForEnd: true; onStreamFinished: { var p = Model.parseCurrentProfile(text); if (p) { root.currentProfile = p; var i = root.profiles.indexOf(p); if (i >= 0) root.profileIndex = i }; root.acProfile = Model.parseProfiles(text); root.profileLoaded = true } } }
@@ -639,7 +941,7 @@ Panel {
     }
     Process {
         id: fanModProc
-        command: ["asusctl", "fan-curve", "--mod-profile", root.currentProfile || "Balanced"]
+        command: ["asusctl", "fan-curve", "--mod-profile", root.fanProfile]
         stdout: StdioCollector {
             waitForEnd: true
             onStreamFinished: {
@@ -651,24 +953,56 @@ Panel {
         }
     }
     Process { id: armouryProc; command: ["asusctl", "armoury", "list"]; stdout: StdioCollector { waitForEnd: true; onStreamFinished: {
-        root.armourySupported = Model.parseArmourySupported(text)
-        var lines = text.split("\n"), cur = ""
-        for (var i = 0; i < lines.length; i++) {
-            var l = lines[i].trim()
-            if (l.indexOf(":") >= 0 && l.indexOf("current") < 0 && l.indexOf("default") < 0 && l.indexOf("Multiple") < 0 && l.indexOf("devices") < 0) cur = l.replace(":", "").trim()
-            if (l.indexOf("current:") >= 0 && cur) {
-                var v = l.substring(l.indexOf("current:") + 8).trim()
-                if (cur === "panel_overdrive") { var t = Model.parseArmouryValue(v); if (t) root.panelOverdrive = t.value === (t.on || 1) }
-                else if (cur === "gpu_mux_mode") { var t2 = Model.parseArmouryValue(v); if (t2) root.gpuMux = t2.value === (t2.on || 1) }
-                else if (cur === "dgpu_disable") { var t3 = Model.parseArmouryValue(v); if (t3) root.dgpuDisable = t3.value === (t3.on || 1) }
-                else if (cur === "ppt_pl1_spl") { var t4 = Model.parseArmouryValue(v); if (t4 && t4.type === "range") { root.pptPl1 = t4.value; root.pptPl1Min = t4.min; root.pptPl1Max = t4.max } }
-                else if (cur === "ppt_pl2_sppt") { var t5 = Model.parseArmouryValue(v); if (t5 && t5.type === "range") { root.pptPl2 = t5.value; root.pptPl2Min = t5.min; root.pptPl2Max = t5.max } }
-                else if (cur === "nv_dynamic_boost") { var t6 = Model.parseArmouryValue(v); if (t6 && t6.type === "range") root.nvDynBoost = t6.value }
-                else if (cur === "nv_temp_target") { var t7 = Model.parseArmouryValue(v); if (t7 && t7.type === "range") root.nvTempTarget = t7.value }
-                cur = ""
-            }
-        }
+        var a = Model.parseArmoury(text)
+        root.armourySupported = a.supported
+        root.armouryDefaults = a.defaults
+        var v = a.values, r = a.ranges
+        if (v.panel_overdrive !== undefined) root.panelOverdrive = v.panel_overdrive === 1
+        if (v.gpu_mux_mode !== undefined) root.gpuMux = v.gpu_mux_mode === 1
+        if (v.dgpu_disable !== undefined) root.dgpuDisable = v.dgpu_disable === 1
+        if (v.ppt_pl1_spl !== undefined) root.pptPl1 = v.ppt_pl1_spl
+        if (r.ppt_pl1_spl) { root.pptPl1Min = r.ppt_pl1_spl.min; root.pptPl1Max = r.ppt_pl1_spl.max }
+        if (v.ppt_pl2_sppt !== undefined) root.pptPl2 = v.ppt_pl2_sppt
+        if (r.ppt_pl2_sppt) { root.pptPl2Min = r.ppt_pl2_sppt.min; root.pptPl2Max = r.ppt_pl2_sppt.max }
+        if (v.nv_dynamic_boost !== undefined) root.nvDynBoost = v.nv_dynamic_boost
+        if (r.nv_dynamic_boost) { root.nvDynBoostMin = r.nv_dynamic_boost.min; root.nvDynBoostMax = r.nv_dynamic_boost.max }
+        if (v.nv_temp_target !== undefined) root.nvTempTarget = v.nv_temp_target
+        if (r.nv_temp_target) { root.nvTempTargetMin = r.nv_temp_target.min; root.nvTempTargetMax = r.nv_temp_target.max }
     } } }
-    Process { id: actionProc; onExited: function() { if (!profileProc.running) profileProc.running = true; if (!batteryProc.running) batteryProc.running = true; if (!ledProc.running) ledProc.running = true; if (!armouryProc.running) armouryProc.running = true; if (!fanDetailProc.running) fanDetailProc.running = true } }
+    Process { id: monitorProc; command: ["hyprctl", "-j", "monitors"]; stdout: StdioCollector { waitForEnd: true; onStreamFinished: { var m = Model.parseMonitors(text); if (m) root.monitor = m } } }
+    Process { id: checkHyprmoncfg; command: ["which", "hyprmoncfg"]; onExited: function(ec) { root.hyprmoncfgAvailable = ec === 0; if (root.hyprmoncfgAvailable && !hyprmoncfgProc.running) hyprmoncfgProc.running = true } }
+    // Re-read on every refresh: the active profile changes when monitors are
+    // plugged or unplugged, and saving into a stale profile name would either
+    // fail or overwrite the wrong one.
+    Process { id: hyprmoncfgProc; command: ["hyprmoncfg", "status", "--json"]; stdout: StdioCollector { waitForEnd: true; onStreamFinished: {
+        var s = Model.parseHyprmoncfgStatus(text)
+        root.hyprmoncfgManaged = s.managed
+        root.hyprmoncfgProfile = s.profile
+    } } }
+    Process {
+        id: displayProc
+        onExited: function(ec) {
+            if (ec === 0 && root.hyprmoncfgManaged && root.hyprmoncfgProfile !== "" && !hyprmoncfgSaveProc.running) {
+                hyprmoncfgSaveProc.command = ["hyprmoncfg", "save", root.hyprmoncfgProfile]
+                hyprmoncfgSaveProc.running = true
+                return
+            }
+            if (!monitorProc.running) monitorProc.running = true
+        }
+    }
+    Process { id: hyprmoncfgSaveProc; onExited: function() { if (!monitorProc.running) monitorProc.running = true } }
+    Process { id: sensorProc; command: Model.sensorCommand(); stdout: StdioCollector { waitForEnd: true; onStreamFinished: { root.sensors = Model.parseSensors(text) } } }
+    Process { id: actionProc; onExited: function() { if (!profileProc.running) profileProc.running = true; if (!batteryProc.running) batteryProc.running = true; if (!ledProc.running) ledProc.running = true; if (!armouryProc.running) armouryProc.running = true; if (!monitorProc.running) monitorProc.running = true; if (!fanDetailProc.running) fanDetailProc.running = true } }
     Timer { interval: root.refreshInterval; running: root.opened && root.asusctlAvailable; repeat: true; onTriggered: root.refresh() }
+
+    // Sensors run on their own, faster tick — the asusctl round-trip is much
+    // heavier and its values barely move. Backs off while the panel is closed,
+    // where the readings only feed the bar tooltip.
+    Timer {
+        interval: root.opened ? 2000 : 20000
+        running: root.asusctlAvailable
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: if (!sensorProc.running) sensorProc.running = true
+    }
 }

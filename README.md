@@ -17,18 +17,72 @@ that.
 
 ## Features
 
-- **Main** — power profile (Quiet/Balanced/Performance), battery charge limit
-  (when supported).
+- **Live sensors** — CPU and GPU temperature, both fan speeds, GPU draw and
+  utilisation, battery charge and charge rate, refreshed every 2 seconds while
+  the panel is open. The same readings appear in the bar icon's tooltip, so
+  "how hot is it right now" needs no click.
+- **Main** — performance mode (Quiet/Balanced/Performance, tinted by mode),
+  GPU mode (Eco/Standard/Ultimate), screen refresh rate and panel overdrive,
+  battery charge limit.
 - **RGB** — keyboard lighting, filtered to the aura effects your laptop
   actually reports (`asusctl info --show-supported`), not a fixed list of
-  twelve.
-- **Fan** — a master "Custom Fan Curves" switch (previously missing from the
-  UI, causing per-fan toggles to silently no-op), draggable fan curve editor
-  per fan (CPU/GPU, plus Mid on laptops with a third fan), and a one-click
-  reset always visible next to each curve.
-- **Advanced** — firmware limits (PL1/PL2, GPU boost/temp target, GPU MUX,
-  dGPU disable, panel overdrive), each shown only if `asusctl armoury list`
-  reports your laptop actually exposes it.
+  twelve, plus brightness and the awake/boot/sleep power states.
+- **Fan** — a master "Custom Fan Curves" switch, a per-profile curve editor
+  (curves are stored per power profile, so you pick which profile you are
+  tuning), draggable curves per fan (CPU/GPU, plus Mid on laptops with a third
+  fan) with the live RPM and temperature for that fan alongside, and a
+  one-click reset.
+- **Advanced** — firmware power limits (PL1/PL2, GPU dynamic boost, GPU temp
+  target) with ranges read from the firmware and a "Defaults" button that
+  replays the values `asusctl` reports as default. Each control appears only
+  if `asusctl armoury list` says your laptop exposes it.
+- **Bar icon** — scroll over it to cycle performance modes without opening the
+  panel.
+
+### G-Helper parity
+
+This mirrors [G-Helper](https://github.com/seerge/g-helper)'s layout and
+feature set where Linux tooling allows it. What is deliberately absent:
+
+| G-Helper feature | Status here |
+|---|---|
+| Anime Matrix / Slash display | Not implemented (no such hardware to test against) |
+| CPU boost toggle | Needs root writes to `intel_pstate`/`cpufreq`; `asusctl` exposes no equivalent |
+| AutoTDP, FPS limiter, overlay | Windows-only mechanisms |
+| Per-key / per-zone RGB | `asusctl` exposes zones only on some models; single-colour effects only for now |
+| Automatic AC/battery profile switching | `asusctl` applies its own AC/battery profiles; not duplicated here |
+
+### Screen refresh rate
+
+`asusctl` has no display controls, so the refresh buttons drive Hyprland
+directly. The built-in `eDP-*` panel is preferred over external monitors, since
+this is a laptop-screen feature.
+
+Two details worth knowing:
+
+- Hyprland 0.56 parses its config as Lua, and `hyprctl keyword monitor` is
+  rejected against a non-legacy parser. The mode change goes through
+  `hyprctl eval "hl.monitor({ ... })"` instead — the same call
+  `omarchy-hyprland-monitor-scaling` uses. Position and scale are always
+  repeated, because `hl.monitor` replaces the whole rule.
+- If [hyprmoncfg](https://github.com/crmne/hyprmoncfg) is installed and its
+  daemon is running, it owns monitor configuration and re-applies its active
+  saved profile a few seconds after any runtime change — a plain `hl.monitor`
+  call silently reverts. The plugin detects this (`hyprmoncfg status --json`)
+  and follows the mode change with `hyprmoncfg save <active profile>` so it
+  sticks and survives a reboot. The Screen header shows the profile name when
+  this is in effect.
+
+  Note that `hyprmoncfg save` snapshots the *whole* current monitor state, not
+  just the refresh rate, so it also refreshes that profile's workspace-to-output
+  assignments. Without the daemon, the runtime change stands on its own and
+  lasts until the Hyprland config is reloaded.
+
+## Development
+
+```bash
+node test-model.js   # parser regression checks against real asusctl output
+```
 
 ## Prerequisites
 
