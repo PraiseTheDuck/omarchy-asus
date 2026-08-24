@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.moneytosms.asus",
+  "name": "ASUS",
+  "version": "2.0.0",
+  "author": "moneytosms",
+  "license": "MIT",
+  "homepage": "https://github.com/moneytosms/omarchy-asus",
+  "description": "Tabbed ASUS laptop control — power profiles, keyboard RGB, editable fan curves, and firmware limits — from the Omarchy bar",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "ASUS",
+    "description": "Profile switching, keyboard RGB, fan curves, and battery charge limit for ASUS ROG/TUF laptops",
+    "category": "System",
+    "aliases": ["asus", "rog", "tuf", "aura", "fan", "rgb", "lighting"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showBatteryLimit": true,
+      "refreshIntervalSec": 10
+    },
+    "schema": [
+      {
+        "key": "showBatteryLimit",
+        "type": "boolean",
+        "label": "Show battery charge limit",
+        "defaultValue": true
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 60,
+        "step": 5,
+        "defaultValue": 10
+      }
+    ]
+  }
+}
