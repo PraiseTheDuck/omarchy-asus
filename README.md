@@ -107,7 +107,7 @@ sudo systemctl enable --now asusd.service
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/moneytosms/omarchy-asus.git --enable
+omarchy plugin add https://github.com/PraiseTheDuck/omarchy-asus.git --enable
 ```
 
 Or clone manually into `~/.config/omarchy/plugins/io.github.moneytosms.asus`
