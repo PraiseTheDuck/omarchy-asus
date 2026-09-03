@@ -102,6 +102,16 @@ function profileLabel(name) {
     return name || "\u2014"
 }
 
+// Linux exposes the active platform profile as a lower-case sysfs value.
+// Normalise it to the names asusctl uses everywhere else in the UI.
+function parsePlatformProfile(raw) {
+    var n = String(raw || "").trim().split("\n")[0].toLowerCase()
+    if (n === "quiet" || n === "low-power") return "Quiet"
+    if (n === "balanced" || n === "balanced-performance") return "Balanced"
+    if (n === "performance") return "Performance"
+    return ""
+}
+
 function parseCurrentProfile(raw) {
     var text = String(raw || "").trim()
     var idx = text.indexOf("Active profile:")

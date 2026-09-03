@@ -50,7 +50,8 @@ that.
   replays the values `asusctl` reports as default. Each control appears only
   if `asusctl armoury list` says your laptop exposes it.
 - **Bar icon** — scroll over it to cycle performance modes without opening the
-  panel.
+  panel. It watches Linux's `platform_profile` attribute, so changes made by
+  `asusctl`, scripts, or hardware keys update the icon immediately too.
 
 ### G-Helper parity
 

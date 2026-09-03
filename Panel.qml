@@ -310,6 +310,15 @@ Panel {
     readonly property bool showBatteryLimit: setting("showBatteryLimit", true) === true
     readonly property int refreshInterval: Math.max(5, Math.min(60, Number(setting("refreshIntervalSec", 10)) || 10)) * 1000
 
+    function applyPlatformProfile(raw) {
+        var p = Model.parsePlatformProfile(raw)
+        if (p === "") return
+        currentProfile = p
+        var i = profiles.indexOf(p)
+        if (i >= 0) profileIndex = i
+        profileLoaded = true
+    }
+
     function refresh() {
         if (!asusctlAvailable) { checkAsusctl.running = true; return }
         if (!profileProc.running) profileProc.running = true
@@ -978,7 +987,7 @@ Panel {
         }
     }
 
-    IpcHandler { target: "io.github.moneytosms.asus"; function open() { root.open() } function close() { root.close() } function show() { root.open() } function hide() { root.close() } function toggle() { root.toggle() } function refresh() { root.refresh() } }
+    IpcHandler { target: "io.github.moneytosms.asus"; function open() { root.open() } function close() { root.close() } function show() { root.open() } function hide() { root.close() } function toggle() { root.toggle() } function refresh() { root.refresh() } function profile(): string { return root.currentProfile } }
     onOpenedChanged: {
         if (opened) {
             gpuMetricsDue = true
@@ -990,6 +999,19 @@ Panel {
         }
     }
     Component.onCompleted: { checkAsusctl.running = true; checkHyprmoncfg.running = true }
+
+    // asusctl writes this kernel attribute for every profile transition,
+    // including changes made by external scripts and hardware hotkeys. Watch
+    // it directly so the bar icon updates without opening or polling the full
+    // panel. profileProc remains the fallback for machines without this file.
+    FileView {
+        id: platformProfileFile
+        path: "/sys/firmware/acpi/platform_profile"
+        watchChanges: true
+        printErrors: false
+        onLoaded: root.applyPlatformProfile(text())
+        onFileChanged: reload()
+    }
 
     Process { id: checkAsusctl; command: ["which", "asusctl"]; onExited: function(ec) { root.asusctlAvailable = ec === 0; if (root.asusctlAvailable) refresh() } }
     Process { id: profileProc; command: ["asusctl", "profile", "get"]; stdout: StdioCollector { waitForEnd: true; onStreamFinished: { var p = Model.parseCurrentProfile(text); if (p) { root.currentProfile = p; var i = root.profiles.indexOf(p); if (i >= 0) root.profileIndex = i }; root.acProfile = Model.parseProfiles(text); root.profileLoaded = true } } }

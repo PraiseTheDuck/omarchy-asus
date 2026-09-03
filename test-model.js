@@ -73,6 +73,14 @@ assert.equal(M.parseArmouryValue("[(0),1]").value, 0)
 assert.equal(M.parseArmouryValue("[0,(1)]").value, 1)
 assert.equal(M.parseArmouryValue("[0,1,2]"), null)
 
+// The event-driven sysfs watcher feeds lower-case kernel profile names into
+// the same title-cased state used by asusctl and the bar icon.
+assert.equal(M.parsePlatformProfile("quiet\n"), "Quiet")
+assert.equal(M.parsePlatformProfile("balanced\n"), "Balanced")
+assert.equal(M.parsePlatformProfile("performance\n"), "Performance")
+assert.equal(M.parsePlatformProfile("low-power\n"), "Quiet")
+assert.equal(M.parsePlatformProfile("unknown\n"), "")
+
 // ---------------------------------------------------------------- sensors
 const SENSORS = `cpu_temp=63000
 fan_cpu=3000
