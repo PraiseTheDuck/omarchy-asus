@@ -56,6 +56,17 @@ assert.equal(a.values.gpu_mux_mode, 0)
 // "Multiple asusd interfaces devices found" must not be read as an attribute.
 assert.equal(a.supported["Multiple asusd interfaces devices found"], undefined)
 
+// asusctl lists known firmware attributes even when the current kernel cannot
+// read them. They are not usable controls until a value becomes available.
+const unavailable = M.parseArmoury(`nv_dynamic_boost:
+  current: unavailable
+nv_temp_target:
+  current: 75..[80]..87
+  default: 87
+`)
+assert.equal(unavailable.supported.nvDynBoost, false)
+assert.equal(unavailable.supported.nvTempTarget, true)
+
 // The current option is whichever one is parenthesised — matching only the
 // first entry made every toggle read as "off" no matter its real state.
 assert.equal(M.parseArmouryValue("[(0),1]").value, 0)
@@ -129,9 +140,25 @@ assert.deepEqual(M.parseHyprmoncfgStatus(""), { managed: false, profile: "" })
 assert.deepEqual(M.parseHyprmoncfgStatus("command not found"), { managed: false, profile: "" })
 
 // ---------------------------------------------------------------- gpu mode
-assert.equal(M.gpuModeId(0, 0), "standard")
-assert.equal(M.gpuModeId(0, 1), "eco")
-assert.equal(M.gpuModeId(1, 0), "ultimate")
+// Firmware ABI: gpu_mux_mode 0 = discrete/Ultimate, 1 = Optimus.
+assert.equal(M.gpuModeId(1, 0), "standard")
+assert.equal(M.gpuModeId(1, 1), "eco")
+assert.equal(M.gpuModeId(0, 0), "ultimate")
+
+// asusctl's CLI does not coordinate the two GPU attributes like its GUI does.
+// Every supported value must therefore be queued for a mode transition.
+assert.deepEqual(M.gpuModeCommands("eco", true, true), [
+    ["asusctl", "armoury", "set", "dgpu_disable", "1"],
+    ["asusctl", "armoury", "set", "gpu_mux_mode", "1"]
+])
+assert.deepEqual(M.gpuModeCommands("ultimate", true, true), [
+    ["asusctl", "armoury", "set", "dgpu_disable", "0"],
+    ["asusctl", "armoury", "set", "gpu_mux_mode", "0"]
+])
+assert.deepEqual(M.gpuModeCommands("standard", false, true), [
+    ["asusctl", "armoury", "set", "dgpu_disable", "0"]
+])
+assert.deepEqual(M.gpuModeCommands("ultimate", false, true), [])
 
 // ---------------------------------------------------------------- features
 // asusctl 6.x names the charge limit ChargeControlEndThreshold; matching only

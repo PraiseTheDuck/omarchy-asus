@@ -343,6 +343,10 @@ function parseArmoury(raw) {
             if (!cur) continue
             var p = parseArmouryValue(l.substring(8).trim())
             if (p) {
+                // `armoury list` includes known attributes whose sysfs value
+                // is currently unavailable.  Those must not surface as
+                // writable controls: asusctl cannot read or set them.
+                out.supported[cur] = true
                 out.values[cur] = p.value
                 if (p.type === "range") out.ranges[cur] = { min: p.min, max: p.max }
             }
@@ -355,7 +359,6 @@ function parseArmoury(raw) {
             continue
         }
         cur = l.replace(":", "").trim()
-        out.supported[cur] = true
     }
     // Keep the legacy camelCase flags the panel's `visible:` bindings read.
     out.supported.panelOverdrive = !!out.supported["panel_overdrive"]
@@ -495,13 +498,18 @@ function fmtWatts(w) { return w < 0 ? "—" : (Math.round(w * 10) / 10) + " W" }
 // the pair of armoury attributes G-Helper drives on Windows:
 //   Eco      dGPU powered down, iGPU drives the panel
 //   Standard hybrid / Optimus, dGPU available on demand
-//   Ultimate MUX hands the panel straight to the dGPU (reboot required)
+//   Ultimate MUX hands the panel straight to the dGPU
+//
+// gpu_mux_mode follows the firmware ABI: 0 = discrete/Ultimate, 1 =
+// Optimus.  GPU attributes are queued by asusd and applied during shutdown,
+// so every mode change requires a reboot and both supported attributes must
+// be submitted as one logical action.
 var gpuModes = [
-    { id: "eco",      name: "Eco",      icon: "\u{F06C0}", desc: "iGPU only, dGPU off",  mux: 0, dgpuDisable: 1, reboot: false,
-      tip: "Powers the discrete GPU down completely.\nBest battery life; games and CUDA will not see a dGPU." },
-    { id: "standard", name: "Standard", icon: "\u{F035B}", desc: "Hybrid (Optimus)",     mux: 0, dgpuDisable: 0, reboot: false,
-      tip: "Hybrid graphics. The iGPU drives the screen and the\ndiscrete GPU wakes on demand. The normal setting." },
-    { id: "ultimate", name: "Ultimate", icon: "\u{F04C5}", desc: "dGPU direct — needs reboot", mux: 1, dgpuDisable: 0, reboot: true,
+    { id: "eco",      name: "Eco",      icon: "\u{F06C0}", desc: "iGPU only, dGPU off — needs reboot", mux: 1, dgpuDisable: 1, reboot: true,
+      tip: "Powers the discrete GPU down completely.\nBest battery life; games and CUDA will not see a dGPU.\nTakes effect after a reboot." },
+    { id: "standard", name: "Standard", icon: "\u{F035B}", desc: "Hybrid (Optimus) — needs reboot", mux: 1, dgpuDisable: 0, reboot: true,
+      tip: "Hybrid graphics. The iGPU drives the screen and the\ndiscrete GPU wakes on demand. The normal setting.\nTakes effect after a reboot." },
+    { id: "ultimate", name: "Ultimate", icon: "\u{F04C5}", desc: "dGPU direct — needs reboot", mux: 0, dgpuDisable: 0, reboot: true,
       tip: "MUX switch: the discrete GPU drives the internal panel\ndirectly. Fastest for games, costs battery life.\nTakes effect after a reboot." }
 ]
 
@@ -515,14 +523,31 @@ var armouryTips = {
     panel_overdrive: "Speeds up pixel transitions to cut ghosting at high refresh rates.\nCan cause slight overshoot artefacts on some panels."
 }
 
-function gpuModeId(mux, dgpuDisabled) {
-    if (mux) return "ultimate"
+function gpuModeId(muxMode, dgpuDisabled) {
+    if (muxMode === 0) return "ultimate"
     return dgpuDisabled ? "eco" : "standard"
 }
 
 function gpuModeDef(id) {
     for (var i = 0; i < gpuModes.length; i++) if (gpuModes[i].id === id) return gpuModes[i]
     return gpuModes[1]
+}
+
+// Build the complete two-attribute transaction expected by asusd.  The CLI
+// deliberately treats each firmware attribute independently, unlike the
+// upstream GUI, so callers must submit both values themselves.  Unsupported
+// attributes are omitted for mux-less or dgpu-disable-less laptops.
+function gpuModeCommands(id, hasMux, hasDgpuDisable) {
+    var def = null
+    for (var i = 0; i < gpuModes.length; i++) if (gpuModes[i].id === id) { def = gpuModes[i]; break }
+    if (!def) return []
+    if (id === "eco" && !hasDgpuDisable) return []
+    if (id === "ultimate" && !hasMux) return []
+
+    var commands = []
+    if (hasDgpuDisable) commands.push(["asusctl", "armoury", "set", "dgpu_disable", String(def.dgpuDisable)])
+    if (hasMux) commands.push(["asusctl", "armoury", "set", "gpu_mux_mode", String(def.mux)])
+    return commands
 }
 
 // ============================================================

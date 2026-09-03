@@ -198,6 +198,11 @@ Panel {
     property int batteryLimit: 100
     property bool asusctlAvailable: false
     property bool cursorActive: false
+    // Every write goes through one Process. Keep an explicit FIFO so rapid
+    // clicks and multi-attribute operations cannot replace a command that is
+    // already running.
+    property var actionQueue: []
+    property string actionError: ""
 
     // Live sensors — refreshed on a faster tick than the asusctl state, since
     // temps and fan speeds are the numbers you actually watch move.
@@ -277,7 +282,9 @@ Panel {
     property var armourySupported: ({ panelOverdrive: false, gpuMux: false, dgpuDisable: false, pptPl1: false, pptPl2: false, nvDynBoost: false, nvTempTarget: false })
     property var armouryDefaults: ({})
     property bool panelOverdrive: false
-    property bool gpuMux: false
+    // Firmware ABI: 0 = discrete/Ultimate, 1 = Optimus. Keep the numeric
+    // value so its inverted meaning is never hidden behind a misleading bool.
+    property int gpuMuxMode: 1
     property bool dgpuDisable: false
     property int pptPl1: 115
     property int pptPl1Min: 25
@@ -294,7 +301,7 @@ Panel {
 
     // GPU mode is derived from the mux/dgpu pair rather than stored, so it
     // can never drift out of sync with what the firmware actually reports.
-    readonly property string gpuMode: Model.gpuModeId(gpuMux, dgpuDisable)
+    readonly property string gpuMode: Model.gpuModeId(gpuMuxMode, dgpuDisable)
     readonly property bool hasGpuMode: armourySupported.gpuMux || armourySupported.dgpuDisable
 
     readonly property bool showBatteryLimit: setting("showBatteryLimit", true) === true
@@ -312,7 +319,35 @@ Panel {
         if (supported.hasFanCurve) { if (!fanDetailProc.running) fanDetailProc.running = true }
     }
 
-    function setProfile(p) { if (!p || actionProc.running) return; actionProc.command = ["asusctl", "profile", "set", p]; actionProc.running = true }
+    function enqueueActions(commands) {
+        if (!commands || commands.length === 0) return
+        actionError = ""
+        var q = actionQueue.slice()
+        for (var i = 0; i < commands.length; i++) {
+            if (commands[i] && commands[i].length > 0) q.push(commands[i])
+        }
+        actionQueue = q
+        runNextAction()
+    }
+    function enqueueAction(command) { enqueueActions([command]) }
+    function runNextAction() {
+        if (actionProc.running || actionQueue.length === 0) return
+        var q = actionQueue.slice()
+        var command = q.shift()
+        actionQueue = q
+        actionProc.command = command
+        actionProc.running = true
+    }
+    function refreshAfterActions() {
+        if (!profileProc.running) profileProc.running = true
+        if (supported.hasBattery && !batteryProc.running) batteryProc.running = true
+        if (supported.hasAura && !ledProc.running) ledProc.running = true
+        if (!armouryProc.running) armouryProc.running = true
+        if (!monitorProc.running) monitorProc.running = true
+        if (supported.hasFanCurve && !fanDetailProc.running) fanDetailProc.running = true
+    }
+
+    function setProfile(p) { if (!p) return; enqueueAction(["asusctl", "profile", "set", p]) }
     function cycleProfile(d) { profileIndex = Model.selectProfileIndex(profileIndex, d, profiles); setProfile(profiles[profileIndex]) }
 
     function applyEffect() {
@@ -322,7 +357,7 @@ Panel {
         if (needsColor2) params.color2 = color2Hex
         if (needsSpeed) params.speed = currentSpeed
         if (needsDirection) params.direction = currentDirection
-        actionProc.command = Model.buildAuraCommand(currentEffect, params); actionProc.running = true
+        enqueueAction(Model.buildAuraCommand(currentEffect, params))
     }
     function selectEffect(id) { currentEffect = id; applyEffect() }
     function setPresetColor(hex) { var r = Model.hexToRgb(hex); colorR = r.r; colorG = r.g; colorB = r.b; applyEffect() }
@@ -332,35 +367,33 @@ Panel {
     // full triple — sending only the changed flag makes asusctl default the
     // omitted ones back to false.
     function applyLedPower() {
-        actionProc.command = ["asusctl", "aura", "power-tuf",
-                              "--awake", ledAwake ? "true" : "false", "--keyboard",
-                              "--boot", ledBoot ? "true" : "false",
-                              "--sleep", ledSleep ? "true" : "false"]
-        actionProc.running = true
+        enqueueAction(["asusctl", "aura", "power-tuf",
+                       "--awake", ledAwake ? "true" : "false", "--keyboard",
+                       "--boot", ledBoot ? "true" : "false",
+                       "--sleep", ledSleep ? "true" : "false"])
     }
     function setLedPower(on) { ledAwake = on; applyLedPower() }
     function setLedBoot(on) { ledBoot = on; applyLedPower() }
     function setLedSleep(on) { ledSleep = on; applyLedPower() }
-    function setLedBrightness(level) { ledBrightness = level; actionProc.command = ["asusctl", "leds", "set", level]; actionProc.running = true }
-    function setBatteryLimit(l) { if (!supported.hasBattery) return; var c = Math.max(20, Math.min(100, Math.round(l))); actionProc.command = ["asusctl", "battery", "limit", String(c)]; actionProc.running = true }
+    function setLedBrightness(level) { ledBrightness = level; enqueueAction(["asusctl", "leds", "set", level]) }
+    function setBatteryLimit(l) { if (!supported.hasBattery) return; var c = Math.max(20, Math.min(100, Math.round(l))); enqueueAction(["asusctl", "battery", "limit", String(c)]) }
 
     // Fan curves — every write is gated on profileLoaded so an action never
     // silently lands on the wrong (hardcoded "Balanced") profile because the
     // real active profile hadn't loaded yet. This was the root cause of fan
     // controls appearing to "not work sometimes".
-    function toggleFanCurves() { if (!supported.hasFanCurve || !profileLoaded) return; var n = !fanCurveEnabled; actionProc.command = ["asusctl", "fan-curve", "--mod-profile", fanProfile, "--enable-fan-curves", n ? "true" : "false"]; actionProc.running = true }
-    function toggleCpuFan() { if (!profileLoaded) return; var n = !cpuFanEnabled; actionProc.command = ["asusctl", "fan-curve", "--mod-profile", fanProfile, "--enable-fan-curve", n ? "true" : "false", "--fan", "cpu"]; actionProc.running = true }
-    function toggleGpuFan() { if (!profileLoaded) return; var n = !gpuFanEnabled; actionProc.command = ["asusctl", "fan-curve", "--mod-profile", fanProfile, "--enable-fan-curve", n ? "true" : "false", "--fan", "gpu"]; actionProc.running = true }
-    function toggleMidFan() { if (!profileLoaded || !hasMidFan) return; var n = !midFanEnabled; actionProc.command = ["asusctl", "fan-curve", "--mod-profile", fanProfile, "--enable-fan-curve", n ? "true" : "false", "--fan", "mid"]; actionProc.running = true }
-    function resetFanCurves() { if (!profileLoaded) return; actionProc.command = ["asusctl", "fan-curve", "--mod-profile", fanProfile, "--default"]; actionProc.running = true }
+    function toggleFanCurves() { if (!supported.hasFanCurve || !profileLoaded) return; var n = !fanCurveEnabled; enqueueAction(["asusctl", "fan-curve", "--mod-profile", fanProfile, "--enable-fan-curves", n ? "true" : "false"]) }
+    function toggleCpuFan() { if (!profileLoaded) return; var n = !cpuFanEnabled; enqueueAction(["asusctl", "fan-curve", "--mod-profile", fanProfile, "--enable-fan-curve", n ? "true" : "false", "--fan", "cpu"]) }
+    function toggleGpuFan() { if (!profileLoaded) return; var n = !gpuFanEnabled; enqueueAction(["asusctl", "fan-curve", "--mod-profile", fanProfile, "--enable-fan-curve", n ? "true" : "false", "--fan", "gpu"]) }
+    function toggleMidFan() { if (!profileLoaded || !hasMidFan) return; var n = !midFanEnabled; enqueueAction(["asusctl", "fan-curve", "--mod-profile", fanProfile, "--enable-fan-curve", n ? "true" : "false", "--fan", "mid"]) }
+    function resetFanCurves() { if (!profileLoaded) return; enqueueAction(["asusctl", "fan-curve", "--mod-profile", fanProfile, "--default"]) }
     function applyFanCurve(fan, points) {
-        if (!profileLoaded || actionProc.running) return
-        actionProc.command = ["asusctl", "fan-curve", "--mod-profile", fanProfile, "--fan", fan, "--data", Model.serializeFanPoints(points)]
-        actionProc.running = true
+        if (!profileLoaded) return
+        enqueueAction(["asusctl", "fan-curve", "--mod-profile", fanProfile, "--fan", fan, "--data", Model.serializeFanPoints(points)])
     }
     function selectFanProfile(p) { if (!p || p === fanProfile) return; fanEditProfile = p; if (!fanModProc.running) fanModProc.running = true }
 
-    function setArmouryAttr(a, v) { actionProc.command = ["asusctl", "armoury", "set", a, String(v)]; actionProc.running = true }
+    function setArmouryAttr(a, v) { if (armourySupported[a] !== true) return; enqueueAction(["asusctl", "armoury", "set", a, String(v)]) }
     function togglePanelOverdrive() { panelOverdrive = !panelOverdrive; setArmouryAttr("panel_overdrive", panelOverdrive ? 1 : 0) }
     function setPptPl1(v) { pptPl1 = Math.round(v); setArmouryAttr("ppt_pl1_spl", pptPl1) }
     function setPptPl2(v) { pptPl2 = Math.round(v); setArmouryAttr("ppt_pl2_sppt", pptPl2) }
@@ -376,20 +409,17 @@ Panel {
         if (d.nv_temp_target !== undefined) setNvTempTarget(d.nv_temp_target)
     }
 
-    // GPU mode — Eco/Standard/Ultimate collapse to the mux + dgpu_disable
-    // pair. Only the attribute that actually changes is written, so an Eco
-    // switch on a mux-less laptop is still a single valid call.
+    // GPU mode — asusctl's CLI does not coordinate these two attributes like
+    // rog-control-center does, so queue the complete supported pair. asusd
+    // defers both firmware writes until shutdown; every transition therefore
+    // takes effect after a reboot.
     function setGpuMode(id) {
         var def = Model.gpuModeDef(id)
-        if (armourySupported.gpuMux && (def.mux === 1) !== gpuMux) {
-            gpuMux = def.mux === 1
-            setArmouryAttr("gpu_mux_mode", def.mux)
-            return
-        }
-        if (armourySupported.dgpuDisable && (def.dgpuDisable === 1) !== dgpuDisable) {
-            dgpuDisable = def.dgpuDisable === 1
-            setArmouryAttr("dgpu_disable", def.dgpuDisable)
-        }
+        var commands = Model.gpuModeCommands(id, armourySupported.gpuMux, armourySupported.dgpuDisable)
+        if (commands.length === 0) return
+        if (armourySupported.gpuMux) gpuMuxMode = def.mux
+        if (armourySupported.dgpuDisable) dgpuDisable = def.dgpuDisable === 1
+        enqueueActions(commands)
     }
 
     // Applying a refresh rate is two steps where hyprmoncfg is managing
@@ -477,6 +507,16 @@ Panel {
 
                 PanelSeparator { foreground: root.bar.foreground }
 
+                Text {
+                    visible: root.actionError !== ""
+                    width: parent.width
+                    text: root.actionError
+                    wrapMode: Text.WordWrap
+                    color: "#ff6644"
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                }
+
                 // Tab bodies are plain always-built Columns toggled by `visible`
                 // rather than Loader/Component — Quickshell's incubator can take
                 // multiple frames to finish building a freshly-activated Loader's
@@ -559,13 +599,14 @@ Panel {
                                 Button {
                                     required property var modelData
                                     width: gRow.cw
-                                    // Ultimate needs the mux; hiding it outright would
-                                    // shuffle the row, so it is disabled instead.
-                                    enabled: modelData.id !== "ultimate" ? root.armourySupported.dgpuDisable || root.armourySupported.gpuMux : root.armourySupported.gpuMux
+                                    // Eco needs dgpu_disable and Ultimate needs the
+                                    // MUX. Keep unavailable modes in place so the row
+                                    // does not shuffle between laptop models.
+                                    enabled: modelData.id === "eco" ? root.armourySupported.dgpuDisable : modelData.id === "ultimate" ? root.armourySupported.gpuMux : true
                                     opacity: enabled ? 1 : 0.4
                                     iconText: modelData.icon; iconSize: Style.font.title
                                     text: modelData.name
-                                    tooltipText: enabled ? modelData.tip : modelData.tip + "\n\nNot available: this laptop has no MUX switch."
+                                    tooltipText: enabled ? modelData.tip : modelData.tip + (modelData.id === "eco" ? "\n\nNot available: this laptop cannot disable its dGPU." : "\n\nNot available: this laptop has no MUX switch.")
                                     fontSize: Style.font.bodySmall
                                     foreground: root.bar.foreground; fontFamily: root.bar.fontFamily
                                     horizontalPadding: Style.spacing.controlPaddingX
@@ -958,7 +999,7 @@ Panel {
         root.armouryDefaults = a.defaults
         var v = a.values, r = a.ranges
         if (v.panel_overdrive !== undefined) root.panelOverdrive = v.panel_overdrive === 1
-        if (v.gpu_mux_mode !== undefined) root.gpuMux = v.gpu_mux_mode === 1
+        if (v.gpu_mux_mode !== undefined) root.gpuMuxMode = v.gpu_mux_mode
         if (v.dgpu_disable !== undefined) root.dgpuDisable = v.dgpu_disable === 1
         if (v.ppt_pl1_spl !== undefined) root.pptPl1 = v.ppt_pl1_spl
         if (r.ppt_pl1_spl) { root.pptPl1Min = r.ppt_pl1_spl.min; root.pptPl1Max = r.ppt_pl1_spl.max }
@@ -992,7 +1033,26 @@ Panel {
     }
     Process { id: hyprmoncfgSaveProc; onExited: function() { if (!monitorProc.running) monitorProc.running = true } }
     Process { id: sensorProc; command: Model.sensorCommand(); stdout: StdioCollector { waitForEnd: true; onStreamFinished: { root.sensors = Model.parseSensors(text) } } }
-    Process { id: actionProc; onExited: function() { if (!profileProc.running) profileProc.running = true; if (!batteryProc.running) batteryProc.running = true; if (!ledProc.running) ledProc.running = true; if (!armouryProc.running) armouryProc.running = true; if (!monitorProc.running) monitorProc.running = true; if (!fanDetailProc.running) fanDetailProc.running = true } }
+    Process {
+        id: actionProc
+        stderr: StdioCollector { id: actionStderr; waitForEnd: true }
+        onExited: function(ec) {
+            if (ec !== 0) {
+                root.actionQueue = []
+                var detail = String(actionStderr.text || "").trim()
+                root.actionError = detail !== "" ? detail : "ASUS command failed (exit " + ec + ")"
+                actionErrorTimer.restart()
+                root.refreshAfterActions()
+                return
+            }
+            if (root.actionQueue.length > 0) {
+                root.runNextAction()
+                return
+            }
+            root.refreshAfterActions()
+        }
+    }
+    Timer { id: actionErrorTimer; interval: 10000; repeat: false; onTriggered: root.actionError = "" }
     Timer { interval: root.refreshInterval; running: root.opened && root.asusctlAvailable; repeat: true; onTriggered: root.refresh() }
 
     // Sensors run on their own, faster tick — the asusctl round-trip is much

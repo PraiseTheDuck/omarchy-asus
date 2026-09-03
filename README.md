@@ -86,6 +86,22 @@ Two details worth knowing:
   assignments. Without the daemon, the runtime change stands on its own and
   lasts until the Hyprland config is reloaded.
 
+### GPU modes
+
+`asusctl` represents GPU mode with two separate firmware attributes. The
+plugin writes the complete pair for every transition:
+
+| Mode | `dgpu_disable` | `gpu_mux_mode` |
+|---|---:|---:|
+| Eco | 1 | 1 |
+| Standard | 0 | 1 |
+| Ultimate | 0 | 0 |
+
+`asusd` queues these settings and applies them safely during shutdown. Every
+GPU mode change therefore takes effect after a reboot, including Eco and
+Standard. On laptops without a MUX switch, Ultimate is disabled; if the
+firmware cannot disable the dGPU, Eco is disabled.
+
 ## Development
 
 ```bash
@@ -119,8 +135,10 @@ and enable it via the Omarchy plugin menu.
 omarchy plugin remove io.github.moneytosms.asus
 ```
 
-Nothing is written outside the plugin folder and the plugin's own settings
-block in `~/.config/omarchy/shell.json`, which Omarchy drops with the plugin.
+Removal deletes the plugin folder and its settings block in
+`~/.config/omarchy/shell.json`. Hardware settings previously changed through
+`asusctl`, and monitor profiles saved through `hyprmoncfg`, remain in effect;
+removing the UI does not reset them.
 
 ## Configuration
 
