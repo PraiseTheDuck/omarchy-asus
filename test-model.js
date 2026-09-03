@@ -80,6 +80,7 @@ fan_gpu=3100
 bat_pct=99
 bat_status=Charging
 bat_power=8627000
+gpu_state=active
 gpu_temp=51
 gpu_power=6.66
 gpu_util=15
@@ -89,6 +90,7 @@ assert.equal(s.cpuTemp, 63)      // millidegrees -> C
 assert.equal(s.fanCpu, 3000)
 assert.equal(s.gpuTemp, 51)
 assert.equal(s.gpuPower, 7)
+assert.equal(s.gpuState, "active")
 assert.equal(s.batPct, 99)
 assert.equal(s.batStatus, "Charging")
 assert.ok(Math.abs(s.batPower - 8.627) < 0.001)  // microwatts -> W
@@ -97,8 +99,25 @@ assert.ok(Math.abs(s.batPower - 8.627) < 0.001)  // microwatts -> W
 const empty = M.parseSensors("")
 assert.equal(empty.cpuTemp, -1)
 assert.equal(empty.gpuTemp, -1)
+assert.equal(empty.gpuState, "")
 assert.equal(M.fmtTemp(-1), "—")
 assert.equal(M.fmtRpm(0), "off")
+
+// A sleeping dGPU is reported without querying nvidia-smi, so the UI can
+// render SLEEP while all metrics correctly remain unavailable.
+const sleeping = M.parseSensors("gpu_state=suspended\nfan_gpu=0\n")
+assert.equal(sleeping.gpuState, "suspended")
+assert.equal(sleeping.gpuTemp, -1)
+assert.equal(sleeping.gpuPower, -1)
+
+// Most sensor ticks are sysfs-only. The slower metrics form must keep the
+// Runtime D3 guard before nvidia-smi so it never resumes a sleeping GPU.
+const statusOnlyCommand = M.sensorCommand(false)[2]
+const metricsCommand = M.sensorCommand(true)[2]
+assert.ok(statusOnlyCommand.indexOf("runtime_status") >= 0)
+assert.equal(statusOnlyCommand.indexOf("nvidia-smi"), -1)
+assert.ok(metricsCommand.indexOf("runtime_status") < metricsCommand.indexOf("nvidia-smi"))
+assert.ok(metricsCommand.indexOf('[ "$gpu_state" = active ]') >= 0)
 
 // ---------------------------------------------------------------- display
 const MONITORS = JSON.stringify([

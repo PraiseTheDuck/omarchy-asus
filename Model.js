@@ -436,9 +436,11 @@ var presetColors = [
 // ============================================================
 // One shell round-trip per tick instead of a Process per reading. hwmon
 // indices are not stable across boots, so chips are matched by their `name`
-// file rather than a hardcoded hwmonN path. nvidia-smi is optional — the
-// block is skipped entirely on machines without it, and the GPU tiles hide
-// themselves when the keys never arrive.
+// file rather than a hardcoded hwmonN path. Querying nvidia-smi wakes a GPU
+// that is already in Runtime D3, so the base script only reads the NVIDIA
+// display function's sysfs runtime_status (which does not resume it). Callers
+// may append the metrics probe on a slower cadence; it still runs only while
+// the GPU is already active.
 var sensorScript =
     'for h in /sys/class/hwmon/*; do n=$(cat "$h/name" 2>/dev/null); case "$n" in ' +
     'coretemp|k10temp|zenpower) echo "cpu_temp=$(cat "$h/temp1_input" 2>/dev/null)";; ' +
@@ -448,16 +450,26 @@ var sensorScript =
     'echo "bat_pct=$(cat $b/capacity 2>/dev/null)"; ' +
     'echo "bat_status=$(cat $b/status 2>/dev/null)"; ' +
     'echo "bat_power=$(cat $b/power_now 2>/dev/null)"; fi; ' +
-    'if command -v nvidia-smi >/dev/null 2>&1; then ' +
+    'gpu_state=missing; for d in /sys/bus/pci/devices/*; do ' +
+    '[ "$(cat "$d/vendor" 2>/dev/null)" = "0x10de" ] || continue; ' +
+    'class=$(cat "$d/class" 2>/dev/null); case "$class" in ' +
+    '0x030000|0x030200) gpu_state=$(cat "$d/power/runtime_status" 2>/dev/null); ' +
+    '[ -n "$gpu_state" ] || gpu_state=unknown; break;; esac; done; ' +
+    'if [ "$gpu_state" != missing ]; then echo "gpu_state=$gpu_state"; fi; '
+
+var gpuMetricsScript =
+    'if [ "$gpu_state" = active ] && command -v nvidia-smi >/dev/null 2>&1; then ' +
     'nvidia-smi --query-gpu=temperature.gpu,power.draw,utilization.gpu --format=csv,noheader,nounits 2>/dev/null ' +
     '| head -1 | tr -d " " | { IFS=, read t p u; echo "gpu_temp=$t"; echo "gpu_power=$p"; echo "gpu_util=$u"; }; fi'
 
-function sensorCommand() { return ["sh", "-c", sensorScript] }
+function sensorCommand(includeGpuMetrics) {
+    return ["sh", "-c", sensorScript + (includeGpuMetrics ? gpuMetricsScript : "")]
+}
 
 // -1 means "not reported" throughout; callers hide the tile rather than
 // printing a bogus zero.
 function parseSensors(raw) {
-    var r = { cpuTemp: -1, gpuTemp: -1, gpuPower: -1, gpuUtil: -1, fanCpu: -1, fanGpu: -1, batPct: -1, batStatus: "", batPower: -1 }
+    var r = { cpuTemp: -1, gpuTemp: -1, gpuPower: -1, gpuUtil: -1, gpuState: "", fanCpu: -1, fanGpu: -1, batPct: -1, batStatus: "", batPower: -1 }
     var lines = String(raw || "").split("\n")
     for (var i = 0; i < lines.length; i++) {
         var eq = lines[i].indexOf("=")
@@ -469,6 +481,7 @@ function parseSensors(raw) {
         else if (k === "gpu_temp" && !isNaN(n)) r.gpuTemp = Math.round(n)
         else if (k === "gpu_power" && !isNaN(n)) r.gpuPower = Math.round(n)
         else if (k === "gpu_util" && !isNaN(n)) r.gpuUtil = Math.round(n)
+        else if (k === "gpu_state") r.gpuState = v
         else if (k === "fan_cpu" && !isNaN(n)) r.fanCpu = Math.round(n)
         else if (k === "fan_gpu" && !isNaN(n)) r.fanGpu = Math.round(n)
         else if (k === "bat_pct" && !isNaN(n)) r.batPct = Math.round(n)

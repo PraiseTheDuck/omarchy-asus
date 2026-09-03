@@ -27,8 +27,12 @@ that.
 
 - **Live sensors** — CPU and GPU temperature, both fan speeds, GPU draw and
   utilisation, battery charge and charge rate, refreshed every 2 seconds while
-  the panel is open. The same readings appear in the bar icon's tooltip, so
-  "how hot is it right now" needs no click.
+  the panel is open. A suspended NVIDIA GPU is shown as `SLEEP`; the plugin
+  checks PCI Runtime D3 first and never wakes it merely to collect metrics.
+  NVIDIA metrics are sampled at most every 30 seconds and only while the panel
+  is open; background polling is sysfs-only, leaving an idle Hybrid-mode GPU
+  free to sleep. The same readings appear in the bar icon's tooltip, so "how
+  hot is it right now" needs no click.
 - **Main** — performance mode (Quiet/Balanced/Performance, tinted by mode),
   GPU mode (Eco/Standard/Ultimate), screen refresh rate and panel overdrive,
   battery charge limit.

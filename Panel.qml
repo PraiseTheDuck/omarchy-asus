@@ -206,8 +206,10 @@ Panel {
 
     // Live sensors — refreshed on a faster tick than the asusctl state, since
     // temps and fan speeds are the numbers you actually watch move.
-    property var sensors: ({ cpuTemp: -1, gpuTemp: -1, gpuPower: -1, gpuUtil: -1, fanCpu: -1, fanGpu: -1, batPct: -1, batStatus: "", batPower: -1 })
-    readonly property bool hasNvidia: sensors.gpuTemp >= 0
+    property var sensors: ({ cpuTemp: -1, gpuTemp: -1, gpuPower: -1, gpuUtil: -1, gpuState: "", fanCpu: -1, fanGpu: -1, batPct: -1, batStatus: "", batPower: -1 })
+    property bool gpuMetricsDue: true
+    readonly property bool hasNvidia: sensors.gpuState !== "" || sensors.gpuTemp >= 0
+    readonly property bool gpuSleeping: sensors.gpuState === "suspended"
 
     // Display — the built-in panel's current/available refresh rates, read
     // from Hyprland rather than asusctl (which has no display controls).
@@ -317,6 +319,25 @@ Panel {
         if (!monitorProc.running) monitorProc.running = true
         if (hyprmoncfgAvailable && !hyprmoncfgProc.running) hyprmoncfgProc.running = true
         if (supported.hasFanCurve) { if (!fanDetailProc.running) fanDetailProc.running = true }
+    }
+
+    function pollSensors() {
+        if (sensorProc.running) return
+        sensorProc.command = Model.sensorCommand(gpuMetricsDue)
+        gpuMetricsDue = false
+        sensorProc.running = true
+    }
+
+    function updateSensors(raw) {
+        var next = Model.parseSensors(raw)
+        // Status-only ticks keep the last sampled NVIDIA metrics while the
+        // device remains active. Entering Runtime D3 clears them immediately.
+        if (next.gpuState === "active" && next.gpuTemp < 0 && sensors.gpuState === "active") {
+            next.gpuTemp = sensors.gpuTemp
+            next.gpuPower = sensors.gpuPower
+            next.gpuUtil = sensors.gpuUtil
+        }
+        sensors = next
     }
 
     function enqueueActions(commands) {
@@ -445,7 +466,8 @@ Panel {
         tooltipText: {
             var t = "ASUS — " + Model.profileLabel(root.currentProfile)
             if (root.sensors.cpuTemp >= 0) t += "\nCPU  " + Model.fmtTemp(root.sensors.cpuTemp) + "   " + Model.fmtRpm(root.sensors.fanCpu)
-            if (root.sensors.gpuTemp >= 0) t += "\nGPU  " + Model.fmtTemp(root.sensors.gpuTemp) + "   " + Model.fmtRpm(root.sensors.fanGpu)
+            if (root.gpuSleeping) t += "\nGPU  SLEEP (Runtime D3)"
+            else if (root.sensors.gpuTemp >= 0) t += "\nGPU  " + Model.fmtTemp(root.sensors.gpuTemp) + "   " + Model.fmtRpm(root.sensors.fanGpu)
             return t
         }
         onPressed: function(b) { root.toggle() }
@@ -552,10 +574,10 @@ Panel {
                             visible: root.hasNvidia
                             width: sensorGrid.cw
                             caption: "GPU"
-                            tip: "Discrete GPU temperature, its fan speed, and how busy it is.\nIdles near 0% when nothing is using the dGPU."
-                            value: Model.fmtTemp(root.sensors.gpuTemp)
-                            sub: Model.fmtRpm(root.sensors.fanGpu) + (root.sensors.gpuUtil >= 0 ? "   " + root.sensors.gpuUtil + "%" : "")
-                            valueColor: Model.tempColor(root.sensors.gpuTemp)
+                            tip: "Discrete GPU temperature, fan speed, and utilisation.\nSLEEP means Runtime D3 powered it down; the panel does not wake it for metrics."
+                            value: root.gpuSleeping ? "SLEEP" : Model.fmtTemp(root.sensors.gpuTemp)
+                            sub: root.gpuSleeping ? "Runtime D3" : Model.fmtRpm(root.sensors.fanGpu) + (root.sensors.gpuUtil >= 0 ? "   " + root.sensors.gpuUtil + "%" : "")
+                            valueColor: root.gpuSleeping ? "#44cc66" : Model.tempColor(root.sensors.gpuTemp)
                             foreground: root.bar.foreground; fontFamily: root.bar.fontFamily
                         }
                         SensorTile {
@@ -851,7 +873,7 @@ Panel {
                         Row { width: parent.width; spacing: Style.space(8)
                             Rectangle { width: Style.space(12); height: Style.space(12); radius: Style.space(6); color: root.gpuFanEnabled ? "#4488ff" : "#666"; anchors.verticalCenter: parent.verticalCenter }
                             Text { text: "GPU Fan"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true; anchors.verticalCenter: parent.verticalCenter }
-                            Text { text: Model.fmtRpm(root.sensors.fanGpu) + (root.sensors.gpuTemp >= 0 ? "   " + Model.fmtTemp(root.sensors.gpuTemp) : ""); color: Qt.darker(root.bar.foreground, 1.5); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; anchors.verticalCenter: parent.verticalCenter; horizontalAlignment: Text.AlignRight; width: parent.width - Style.space(12) - Style.space(48) - Style.space(70) }
+                            Text { text: root.gpuSleeping ? "SLEEP" : Model.fmtRpm(root.sensors.fanGpu) + (root.sensors.gpuTemp >= 0 ? "   " + Model.fmtTemp(root.sensors.gpuTemp) : ""); color: Qt.darker(root.bar.foreground, 1.5); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; anchors.verticalCenter: parent.verticalCenter; horizontalAlignment: Text.AlignRight; width: parent.width - Style.space(12) - Style.space(48) - Style.space(70) }
                             Rectangle { width: Style.space(48); height: Style.space(20); radius: Style.space(10); color: root.gpuFanEnabled ? Qt.rgba(0.27, 0.53, 1, 0.3) : Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08); anchors.verticalCenter: parent.verticalCenter
                                 MouseArea { id: gpuSwMouse; anchors.fill: parent; hoverEnabled: true; enabled: root.fanCurveEnabled; cursorShape: Qt.PointingHandCursor; onClicked: root.toggleGpuFan() }
                                 PanelToolTip { visible: gpuSwMouse.containsMouse; text: "Use the custom curve below for the GPU fan." }
@@ -952,7 +974,16 @@ Panel {
     }
 
     IpcHandler { target: "io.github.moneytosms.asus"; function open() { root.open() } function close() { root.close() } function show() { root.open() } function hide() { root.close() } function toggle() { root.toggle() } function refresh() { root.refresh() } }
-    onOpenedChanged: { if (opened) { Qt.callLater(refresh); cursorActive = false } }
+    onOpenedChanged: {
+        if (opened) {
+            gpuMetricsDue = true
+            Qt.callLater(refresh)
+            Qt.callLater(pollSensors)
+            cursorActive = false
+        } else {
+            gpuMetricsDue = false
+        }
+    }
     Component.onCompleted: { checkAsusctl.running = true; checkHyprmoncfg.running = true }
 
     Process { id: checkAsusctl; command: ["which", "asusctl"]; onExited: function(ec) { root.asusctlAvailable = ec === 0; if (root.asusctlAvailable) refresh() } }
@@ -1032,7 +1063,7 @@ Panel {
         }
     }
     Process { id: hyprmoncfgSaveProc; onExited: function() { if (!monitorProc.running) monitorProc.running = true } }
-    Process { id: sensorProc; command: Model.sensorCommand(); stdout: StdioCollector { waitForEnd: true; onStreamFinished: { root.sensors = Model.parseSensors(text) } } }
+    Process { id: sensorProc; command: Model.sensorCommand(false); stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.updateSensors(text) } }
     Process {
         id: actionProc
         stderr: StdioCollector { id: actionStderr; waitForEnd: true }
@@ -1063,6 +1094,16 @@ Panel {
         running: root.asusctlAvailable
         repeat: true
         triggeredOnStart: true
-        onTriggered: if (!sensorProc.running) sensorProc.running = true
+        onTriggered: root.pollSensors()
+    }
+
+    // nvidia-smi is useful for live metrics but can extend an active period.
+    // Never run it in the background; while the panel is open, leave thirty
+    // seconds between probes to avoid needless back-to-back driver access.
+    Timer {
+        interval: 30000
+        running: root.opened && root.asusctlAvailable
+        repeat: true
+        onTriggered: root.gpuMetricsDue = true
     }
 }
