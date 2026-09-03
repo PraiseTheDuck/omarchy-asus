@@ -118,6 +118,9 @@ assert.ok(statusOnlyCommand.indexOf("runtime_status") >= 0)
 assert.equal(statusOnlyCommand.indexOf("nvidia-smi"), -1)
 assert.ok(metricsCommand.indexOf("runtime_status") < metricsCommand.indexOf("nvidia-smi"))
 assert.ok(metricsCommand.indexOf('[ "$gpu_state" = active ]') >= 0)
+assert.equal(M.gpuMetricsAllowed("standard"), false)
+assert.equal(M.gpuMetricsAllowed("eco"), false)
+assert.equal(M.gpuMetricsAllowed("ultimate"), true)
 
 // ---------------------------------------------------------------- display
 const MONITORS = JSON.stringify([

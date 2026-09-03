@@ -466,6 +466,11 @@ function sensorCommand(includeGpuMetrics) {
     return ["sh", "-c", sensorScript + (includeGpuMetrics ? gpuMetricsScript : "")]
 }
 
+// NVML/nvidia-smi access is never passive on an Optimus system. Restrict
+// detailed metrics to Ultimate, where the dGPU is the display GPU and cannot
+// enter Runtime D3 anyway. Hybrid/Eco use the sysfs state probe only.
+function gpuMetricsAllowed(gpuMode) { return gpuMode === "ultimate" }
+
 // -1 means "not reported" throughout; callers hide the tile rather than
 // printing a bogus zero.
 function parseSensors(raw) {

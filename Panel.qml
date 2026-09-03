@@ -210,6 +210,7 @@ Panel {
     property bool gpuMetricsDue: true
     readonly property bool hasNvidia: sensors.gpuState !== "" || sensors.gpuTemp >= 0
     readonly property bool gpuSleeping: sensors.gpuState === "suspended"
+    readonly property bool gpuMetricsPaused: !Model.gpuMetricsAllowed(gpuMode)
 
     // Display — the built-in panel's current/available refresh rates, read
     // from Hyprland rather than asusctl (which has no display controls).
@@ -323,16 +324,17 @@ Panel {
 
     function pollSensors() {
         if (sensorProc.running) return
-        sensorProc.command = Model.sensorCommand(gpuMetricsDue)
+        sensorProc.command = Model.sensorCommand(gpuMetricsDue && Model.gpuMetricsAllowed(gpuMode))
         gpuMetricsDue = false
         sensorProc.running = true
     }
 
     function updateSensors(raw) {
         var next = Model.parseSensors(raw)
-        // Status-only ticks keep the last sampled NVIDIA metrics while the
-        // device remains active. Entering Runtime D3 clears them immediately.
-        if (next.gpuState === "active" && next.gpuTemp < 0 && sensors.gpuState === "active") {
+        // Ultimate status-only ticks keep the last sampled NVIDIA metrics
+        // while the device remains active. Hybrid/Eco and Runtime D3 clear
+        // them immediately.
+        if (Model.gpuMetricsAllowed(gpuMode) && next.gpuState === "active" && next.gpuTemp < 0 && sensors.gpuState === "active") {
             next.gpuTemp = sensors.gpuTemp
             next.gpuPower = sensors.gpuPower
             next.gpuUtil = sensors.gpuUtil
@@ -467,6 +469,7 @@ Panel {
             var t = "ASUS — " + Model.profileLabel(root.currentProfile)
             if (root.sensors.cpuTemp >= 0) t += "\nCPU  " + Model.fmtTemp(root.sensors.cpuTemp) + "   " + Model.fmtRpm(root.sensors.fanCpu)
             if (root.gpuSleeping) t += "\nGPU  SLEEP (Runtime D3)"
+            else if (root.gpuMetricsPaused && root.sensors.gpuState === "active") t += "\nGPU  ACTIVE (metrics paused)"
             else if (root.sensors.gpuTemp >= 0) t += "\nGPU  " + Model.fmtTemp(root.sensors.gpuTemp) + "   " + Model.fmtRpm(root.sensors.fanGpu)
             return t
         }
@@ -574,10 +577,12 @@ Panel {
                             visible: root.hasNvidia
                             width: sensorGrid.cw
                             caption: "GPU"
-                            tip: "Discrete GPU temperature, fan speed, and utilisation.\nSLEEP means Runtime D3 powered it down; the panel does not wake it for metrics."
-                            value: root.gpuSleeping ? "SLEEP" : Model.fmtTemp(root.sensors.gpuTemp)
-                            sub: root.gpuSleeping ? "Runtime D3" : Model.fmtRpm(root.sensors.fanGpu) + (root.sensors.gpuUtil >= 0 ? "   " + root.sensors.gpuUtil + "%" : "")
-                            valueColor: root.gpuSleeping ? "#44cc66" : Model.tempColor(root.sensors.gpuTemp)
+                            tip: root.gpuMetricsPaused
+                                ? "Hybrid/Eco uses a passive Runtime D3 check only.\nSLEEP means the dGPU is powered down; ACTIVE means another application is using it."
+                                : "Discrete GPU temperature, fan speed, and utilisation.\nUltimate keeps the dGPU powered, so live metrics are safe to query."
+                            value: root.gpuSleeping ? "SLEEP" : (root.gpuMetricsPaused && root.sensors.gpuState === "active" ? "ACTIVE" : Model.fmtTemp(root.sensors.gpuTemp))
+                            sub: root.gpuSleeping ? "Runtime D3" : (root.gpuMetricsPaused ? "Hybrid · metrics paused" : Model.fmtRpm(root.sensors.fanGpu) + (root.sensors.gpuUtil >= 0 ? "   " + root.sensors.gpuUtil + "%" : ""))
+                            valueColor: root.gpuSleeping ? "#44cc66" : (root.gpuMetricsPaused ? "#ffaa44" : Model.tempColor(root.sensors.gpuTemp))
                             foreground: root.bar.foreground; fontFamily: root.bar.fontFamily
                         }
                         SensorTile {
@@ -591,7 +596,7 @@ Panel {
                             foreground: root.bar.foreground; fontFamily: root.bar.fontFamily
                         }
                         SensorTile {
-                            visible: root.hasNvidia && root.sensors.gpuPower >= 0
+                            visible: root.hasNvidia && !root.gpuMetricsPaused && root.sensors.gpuPower >= 0
                             width: sensorGrid.cw
                             caption: "GPU POWER"
                             tip: "Watts the discrete GPU is currently drawing, and the\ndynamic boost ceiling set on the Advanced tab."
@@ -1098,8 +1103,8 @@ Panel {
     }
 
     // nvidia-smi is useful for live metrics but can extend an active period.
-    // Never run it in the background; while the panel is open, leave thirty
-    // seconds between probes to avoid needless back-to-back driver access.
+    // pollSensors additionally restricts it to Ultimate mode; Hybrid and Eco
+    // remain sysfs-only even when the panel is open.
     Timer {
         interval: 30000
         running: root.opened && root.asusctlAvailable
