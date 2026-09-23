@@ -561,11 +561,17 @@ function gpuModeDef(id) {
     return gpuModes[1]
 }
 
-// Build the complete two-attribute transaction expected by asusd.  The CLI
-// deliberately treats each firmware attribute independently, unlike the
-// upstream GUI, so callers must submit both values themselves.  Unsupported
-// attributes are omitted for mux-less or dgpu-disable-less laptops.
-function gpuModeCommands(id, hasMux, hasDgpuDisable) {
+// Build the asusd GPU-attribute transaction.  The CLI treats each firmware
+// attribute independently, unlike the upstream GUI, so callers must submit
+// the pair themselves — but only the values that actually change.
+//
+// Rewriting an already-current GPU attribute is not a no-op: asusd still
+// queues it, and asus-shutdown applies queued attrs in HashMap order.  On
+// this laptop a redundant `dgpu_disable = 0` write returns EIO while
+// nvidia_drm is loaded, which aborts the whole apply and leaves mux 0
+// unwritten.  Skip attributes that already match so Standard→Ultimate
+// queues only `gpu_mux_mode = 0`.
+function gpuModeCommands(id, hasMux, hasDgpuDisable, currentMux, currentDgpuDisable) {
     var def = null
     for (var i = 0; i < gpuModes.length; i++) if (gpuModes[i].id === id) { def = gpuModes[i]; break }
     if (!def) return []
@@ -573,9 +579,44 @@ function gpuModeCommands(id, hasMux, hasDgpuDisable) {
     if (id === "ultimate" && !hasMux) return []
 
     var commands = []
-    if (hasDgpuDisable) commands.push(["asusctl", "armoury", "set", "dgpu_disable", String(def.dgpuDisable)])
-    if (hasMux) commands.push(["asusctl", "armoury", "set", "gpu_mux_mode", String(def.mux)])
+    if (hasDgpuDisable && currentDgpuDisable !== def.dgpuDisable)
+        commands.push(["asusctl", "armoury", "set", "dgpu_disable", String(def.dgpuDisable)])
+    if (hasMux && currentMux !== def.mux)
+        commands.push(["asusctl", "armoury", "set", "gpu_mux_mode", String(def.mux)])
     return commands
+}
+
+// busctl prints `i 0` / `i -1`.  -1 means nothing is queued for that attr.
+function parseQueuedInt(raw) {
+    var m = String(raw || "").match(/i\s+(-?\d+)/)
+    return m ? parseInt(m[1], 10) : -1
+}
+
+function queuedGpuCommand() {
+    return ["sh", "-c",
+        'echo mux=$(busctl get-property xyz.ljones.Asusd /xyz/ljones/asus_armoury/gpu_mux_mode xyz.ljones.AsusArmoury QueuedGpuValue 2>/dev/null || echo "i -1"); ' +
+        'echo dgpu=$(busctl get-property xyz.ljones.Asusd /xyz/ljones/asus_armoury/dgpu_disable xyz.ljones.AsusArmoury QueuedGpuValue 2>/dev/null || echo "i -1")']
+}
+
+function parseQueuedGpu(raw) {
+    var mux = -1, dgpu = -1
+    var lines = String(raw || "").split("\n")
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i].trim()
+        if (line.indexOf("mux=") === 0) mux = parseQueuedInt(line.substring(4))
+        else if (line.indexOf("dgpu=") === 0) dgpu = parseQueuedInt(line.substring(5))
+    }
+    return { mux: mux, dgpu: dgpu }
+}
+
+// Overlay queued firmware values on the live pair.  Empty string means the
+// queue matches what is already applied, so the panel should not show pending.
+function pendingGpuMode(currentMux, currentDgpuDisable, queuedMux, queuedDgpuDisable) {
+    var mux = (queuedMux === 0 || queuedMux === 1) ? queuedMux : currentMux
+    var dgpu = (queuedDgpuDisable === 0 || queuedDgpuDisable === 1) ? queuedDgpuDisable : currentDgpuDisable
+    var pending = gpuModeId(mux, dgpu === 1)
+    var current = gpuModeId(currentMux, currentDgpuDisable === 1)
+    return pending === current ? "" : pending
 }
 
 // ============================================================

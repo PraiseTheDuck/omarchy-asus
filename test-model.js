@@ -175,8 +175,7 @@ assert.equal(M.gpuModeId(1, 0), "standard")
 assert.equal(M.gpuModeId(1, 1), "eco")
 assert.equal(M.gpuModeId(0, 0), "ultimate")
 
-// asusctl's CLI does not coordinate the two GPU attributes like its GUI does.
-// Every supported value must therefore be queued for a mode transition.
+// Without a live pair, both supported attributes are queued (unknown current).
 assert.deepEqual(M.gpuModeCommands("eco", true, true), [
     ["asusctl", "armoury", "set", "dgpu_disable", "1"],
     ["asusctl", "armoury", "set", "gpu_mux_mode", "1"]
@@ -189,6 +188,24 @@ assert.deepEqual(M.gpuModeCommands("standard", false, true), [
     ["asusctl", "armoury", "set", "dgpu_disable", "0"]
 ])
 assert.deepEqual(M.gpuModeCommands("ultimate", false, true), [])
+
+// Standard (mux 1, dgpu 0) → Ultimate must NOT rewrite dgpu_disable=0: that
+// write EIO-aborts asus-shutdown and leaves mux 0 unapplied.
+assert.deepEqual(M.gpuModeCommands("ultimate", true, true, 1, 0), [
+    ["asusctl", "armoury", "set", "gpu_mux_mode", "0"]
+])
+assert.deepEqual(M.gpuModeCommands("eco", true, true, 1, 0), [
+    ["asusctl", "armoury", "set", "dgpu_disable", "1"]
+])
+assert.deepEqual(M.gpuModeCommands("standard", true, true, 1, 0), [])
+assert.deepEqual(M.gpuModeCommands("ultimate", true, true, 0, 0), [])
+
+assert.equal(M.parseQueuedInt("i 0"), 0)
+assert.equal(M.parseQueuedInt("i -1"), -1)
+assert.deepEqual(M.parseQueuedGpu("mux=i 0\ndgpu=i -1\n"), { mux: 0, dgpu: -1 })
+assert.equal(M.pendingGpuMode(1, 0, 0, -1), "ultimate")
+assert.equal(M.pendingGpuMode(1, 0, -1, -1), "")
+assert.equal(M.pendingGpuMode(0, 0, -1, -1), "")
 
 // ---------------------------------------------------------------- features
 // asusctl 6.x names the charge limit ChargeControlEndThreshold; matching only

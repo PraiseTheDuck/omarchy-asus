@@ -304,7 +304,12 @@ Panel {
 
     // GPU mode is derived from the mux/dgpu pair rather than stored, so it
     // can never drift out of sync with what the firmware actually reports.
-    readonly property string gpuMode: Model.gpuModeId(gpuMuxMode, dgpuDisable)
+    // pendingGpuMode overlays a value queued in asusd for shutdown apply —
+    // armoury list still shows the live firmware pair until reboot.
+    property string pendingGpuMode: ""
+    readonly property string appliedGpuMode: Model.gpuModeId(gpuMuxMode, dgpuDisable)
+    readonly property string gpuMode: pendingGpuMode || appliedGpuMode
+    readonly property bool gpuModePending: pendingGpuMode !== "" && pendingGpuMode !== appliedGpuMode
     readonly property bool hasGpuMode: armourySupported.gpuMux || armourySupported.dgpuDisable
 
     readonly property bool showBatteryLimit: setting("showBatteryLimit", true) === true
@@ -441,16 +446,13 @@ Panel {
         if (d.nv_temp_target !== undefined) setNvTempTarget(d.nv_temp_target)
     }
 
-    // GPU mode — asusctl's CLI does not coordinate these two attributes like
-    // rog-control-center does, so queue the complete supported pair. asusd
-    // defers both firmware writes until shutdown; every transition therefore
-    // takes effect after a reboot.
+    // GPU mode — asusd queues GPU firmware writes until shutdown. Only the
+    // attributes that actually change are submitted: rewriting dgpu_disable
+    // to its current value has been observed to EIO and abort mux apply.
     function setGpuMode(id) {
-        var def = Model.gpuModeDef(id)
-        var commands = Model.gpuModeCommands(id, armourySupported.gpuMux, armourySupported.dgpuDisable)
+        var commands = Model.gpuModeCommands(id, armourySupported.gpuMux, armourySupported.dgpuDisable, gpuMuxMode, dgpuDisable ? 1 : 0)
         if (commands.length === 0) return
-        if (armourySupported.gpuMux) gpuMuxMode = def.mux
-        if (armourySupported.dgpuDisable) dgpuDisable = def.dgpuDisable === 1
+        pendingGpuMode = id
         enqueueActions(commands)
     }
 
@@ -654,6 +656,15 @@ Panel {
                             }
                         }
                         Text { width: parent.width; text: Model.gpuModeDef(root.gpuMode).desc; wrapMode: Text.WordWrap; color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption }
+                        Text {
+                            visible: root.gpuModePending
+                            width: parent.width
+                            text: "Queued " + Model.gpuModeDef(root.gpuMode).name + " (mux " + Model.gpuModeDef(root.gpuMode).mux + "). Reboot to apply — firmware writes this only at shutdown."
+                            wrapMode: Text.WordWrap
+                            color: "#ffaa44"
+                            font.family: root.bar.fontFamily
+                            font.pixelSize: Style.font.caption
+                        }
                     }
 
                     // SCREEN — refresh rate comes from Hyprland, overdrive from
@@ -1067,6 +1078,11 @@ Panel {
         if (r.nv_dynamic_boost) { root.nvDynBoostMin = r.nv_dynamic_boost.min; root.nvDynBoostMax = r.nv_dynamic_boost.max }
         if (v.nv_temp_target !== undefined) root.nvTempTarget = v.nv_temp_target
         if (r.nv_temp_target) { root.nvTempTargetMin = r.nv_temp_target.min; root.nvTempTargetMax = r.nv_temp_target.max }
+        if (!queuedGpuProc.running) queuedGpuProc.running = true
+    } } }
+    Process { id: queuedGpuProc; command: Model.queuedGpuCommand(); stdout: StdioCollector { waitForEnd: true; onStreamFinished: {
+        var q = Model.parseQueuedGpu(text)
+        root.pendingGpuMode = Model.pendingGpuMode(root.gpuMuxMode, root.dgpuDisable ? 1 : 0, q.mux, q.dgpu)
     } } }
     Process { id: monitorProc; command: ["hyprctl", "-j", "monitors"]; stdout: StdioCollector { waitForEnd: true; onStreamFinished: { var m = Model.parseMonitors(text); if (m) root.monitor = m } } }
     Process { id: checkHyprmoncfg; command: ["which", "hyprmoncfg"]; onExited: function(ec) { root.hyprmoncfgAvailable = ec === 0; if (root.hyprmoncfgAvailable && !hyprmoncfgProc.running) hyprmoncfgProc.running = true } }
