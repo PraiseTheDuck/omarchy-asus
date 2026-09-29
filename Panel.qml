@@ -307,6 +307,8 @@ Panel {
     // pendingGpuMode overlays a value queued in asusd for shutdown apply —
     // armoury list still shows the live firmware pair until reboot.
     property string pendingGpuMode: ""
+    property int queuedMux: -1
+    property int queuedDgpu: -1
     readonly property string appliedGpuMode: Model.gpuModeId(gpuMuxMode, dgpuDisable)
     readonly property string gpuMode: pendingGpuMode || appliedGpuMode
     readonly property bool gpuModePending: pendingGpuMode !== "" && pendingGpuMode !== appliedGpuMode
@@ -400,14 +402,16 @@ Panel {
     function setPresetColor(hex) { var r = Model.hexToRgb(hex); colorR = r.r; colorG = r.g; colorB = r.b; applyEffect() }
     function setPresetColor2(hex) { var r = Model.hexToRgb(hex); color2R = r.r; color2G = r.g; color2B = r.b; applyEffect() }
 
-    // power-tuf takes all three states in one call, so each toggle resends the
-    // full triple — sending only the changed flag makes asusctl default the
-    // omitted ones back to false.
+    // 19b6 stores every omitted flag as false, so each toggle resends the
+    // whole keyboard zone. power-tuf is the old interface and does not drive
+    // this keyboard.
     function applyLedPower() {
-        enqueueAction(["asusctl", "aura", "power-tuf",
-                       "--awake", ledAwake ? "true" : "false", "--keyboard",
-                       "--boot", ledBoot ? "true" : "false",
-                       "--sleep", ledSleep ? "true" : "false"])
+        var args = ["asusctl", "aura", "power", "keyboard"]
+        if (ledBoot) args.push("--boot")
+        if (ledAwake) args.push("--awake")
+        if (ledSleep) args.push("--sleep")
+        args.push("--shutdown")
+        enqueueAction(args)
     }
     function setLedPower(on) { ledAwake = on; applyLedPower() }
     function setLedBoot(on) { ledBoot = on; applyLedPower() }
@@ -659,7 +663,7 @@ Panel {
                         Text {
                             visible: root.gpuModePending
                             width: parent.width
-                            text: "Queued " + Model.gpuModeDef(root.gpuMode).name + " (mux " + Model.gpuModeDef(root.gpuMode).mux + "). Reboot to apply — firmware writes this only at shutdown."
+                            text: Model.gpuModeRebootNotice(root.gpuMuxMode, root.dgpuDisable ? 1 : 0, root.queuedMux, root.queuedDgpu)
                             wrapMode: Text.WordWrap
                             color: "#ffaa44"
                             font.family: root.bar.fontFamily
@@ -1082,6 +1086,8 @@ Panel {
     } } }
     Process { id: queuedGpuProc; command: Model.queuedGpuCommand(); stdout: StdioCollector { waitForEnd: true; onStreamFinished: {
         var q = Model.parseQueuedGpu(text)
+        root.queuedMux = q.mux
+        root.queuedDgpu = q.dgpu
         root.pendingGpuMode = Model.pendingGpuMode(root.gpuMuxMode, root.dgpuDisable ? 1 : 0, q.mux, q.dgpu)
     } } }
     Process { id: monitorProc; command: ["hyprctl", "-j", "monitors"]; stdout: StdioCollector { waitForEnd: true; onStreamFinished: { var m = Model.parseMonitors(text); if (m) root.monitor = m } } }

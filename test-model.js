@@ -175,9 +175,9 @@ assert.equal(M.gpuModeId(1, 0), "standard")
 assert.equal(M.gpuModeId(1, 1), "eco")
 assert.equal(M.gpuModeId(0, 0), "ultimate")
 
-// Without a live pair, both supported attributes are queued (unknown current).
+// Unknown current mux: Eco must not queue dgpu_disable alongside the MUX.
+// asus-shutdown applies dgpu_disable first and wedges the reboot.
 assert.deepEqual(M.gpuModeCommands("eco", true, true), [
-    ["asusctl", "armoury", "set", "dgpu_disable", "1"],
     ["asusctl", "armoury", "set", "gpu_mux_mode", "1"]
 ])
 assert.deepEqual(M.gpuModeCommands("ultimate", true, true), [
@@ -197,6 +197,16 @@ assert.deepEqual(M.gpuModeCommands("ultimate", true, true, 1, 0), [
 assert.deepEqual(M.gpuModeCommands("eco", true, true, 1, 0), [
     ["asusctl", "armoury", "set", "dgpu_disable", "1"]
 ])
+// Ultimate → Eco queues only the MUX. dgpu_disable waits until the panel
+// is already on the iGPU.
+assert.deepEqual(M.gpuModeCommands("eco", true, true, 0, 0), [
+    ["asusctl", "armoury", "set", "gpu_mux_mode", "1"]
+])
+// Leaving Eco still enables the dGPU before the MUX hands it the panel.
+assert.deepEqual(M.gpuModeCommands("ultimate", true, true, 1, 1), [
+    ["asusctl", "armoury", "set", "dgpu_disable", "0"],
+    ["asusctl", "armoury", "set", "gpu_mux_mode", "0"]
+])
 assert.deepEqual(M.gpuModeCommands("standard", true, true, 1, 0), [])
 assert.deepEqual(M.gpuModeCommands("ultimate", true, true, 0, 0), [])
 
@@ -206,6 +216,9 @@ assert.deepEqual(M.parseQueuedGpu("mux=i 0\ndgpu=i -1\n"), { mux: 0, dgpu: -1 })
 assert.equal(M.pendingGpuMode(1, 0, 0, -1), "ultimate")
 assert.equal(M.pendingGpuMode(1, 0, -1, -1), "")
 assert.equal(M.pendingGpuMode(0, 0, -1, -1), "")
+assert.ok(M.gpuModeRebootNotice(0, 0, 1, -1).indexOf("second reboot") >= 0)
+assert.ok(M.gpuModeRebootNotice(1, 0, -1, 1).indexOf("does not change the MUX") >= 0)
+assert.equal(M.gpuModeRebootNotice(1, 0, -1, -1), "")
 
 // ---------------------------------------------------------------- features
 // asusctl 6.x names the charge limit ChargeControlEndThreshold; matching only

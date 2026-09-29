@@ -534,7 +534,7 @@ function fmtWatts(w) { return w < 0 ? "—" : (Math.round(w * 10) / 10) + " W" }
 // be submitted as one logical action.
 var gpuModes = [
     { id: "eco",      name: "Eco",      icon: "\u{F06C0}", desc: "iGPU only, dGPU off — needs reboot", mux: 1, dgpuDisable: 1, reboot: true,
-      tip: "Powers the discrete GPU down completely.\nBest battery life; games and CUDA will not see a dGPU.\nTakes effect after a reboot." },
+      tip: "Powers the discrete GPU down completely.\nBest battery life; games and CUDA will not see a dGPU.\nFrom Ultimate this takes two reboots: the first only\nmoves the panel to the iGPU. Disabling the dGPU in\nthat same reboot freezes the machine." },
     { id: "standard", name: "Standard", icon: "\u{F035B}", desc: "Hybrid (Optimus) — needs reboot", mux: 1, dgpuDisable: 0, reboot: true,
       tip: "Hybrid graphics. The iGPU drives the screen and the\ndiscrete GPU wakes on demand. The normal setting.\nTakes effect after a reboot." },
     { id: "ultimate", name: "Ultimate", icon: "\u{F04C5}", desc: "dGPU direct — needs reboot", mux: 0, dgpuDisable: 0, reboot: true,
@@ -565,18 +565,27 @@ function gpuModeDef(id) {
 // attribute independently, unlike the upstream GUI, so callers must submit
 // the pair themselves — but only the values that actually change.
 //
-// Rewriting an already-current GPU attribute is not a no-op: asusd still
-// queues it, and asus-shutdown applies queued attrs in HashMap order.  On
-// this laptop a redundant `dgpu_disable = 0` write returns EIO while
-// nvidia_drm is loaded, which aborts the whole apply and leaves mux 0
-// unwritten.  Skip attributes that already match so Standard→Ultimate
-// queues only `gpu_mux_mode = 0`.
+// asus-shutdown applies the queue in D-Bus path order, and `dgpu_disable`
+// sorts before `gpu_mux_mode`.  Two consequences on this laptop:
+//
+//   * A redundant `dgpu_disable = 0` write returns EIO while nvidia_drm is
+//     loaded and aborts the rest of the apply, so Standard→Ultimate must
+//     queue only `gpu_mux_mode = 0`.
+//   * Eco from Ultimate must not queue both attributes together.  Shutdown
+//     would power the dGPU off while the MUX still routes the panel through
+//     it, and the reboot wedges.  Move the panel to the iGPU first.  The
+//     dGPU is powered off on a later reboot, once `gpu_mux_mode` is already 1.
 function gpuModeCommands(id, hasMux, hasDgpuDisable, currentMux, currentDgpuDisable) {
     var def = null
     for (var i = 0; i < gpuModes.length; i++) if (gpuModes[i].id === id) { def = gpuModes[i]; break }
     if (!def) return []
-    if (id === "eco" && !hasDgpuDisable) return []
+    if (id === "eco" && !hasDgpuDisable && !(hasMux && currentMux !== 1)) return []
     if (id === "ultimate" && !hasMux) return []
+
+    // Unknown mux (the argument was omitted) is treated as "not yet iGPU":
+    // never pair dgpu_disable=1 with a mux write.
+    if (id === "eco" && hasMux && currentMux !== 1)
+        return [["asusctl", "armoury", "set", "gpu_mux_mode", "1"]]
 
     var commands = []
     if (hasDgpuDisable && currentDgpuDisable !== def.dgpuDisable)
@@ -617,6 +626,21 @@ function pendingGpuMode(currentMux, currentDgpuDisable, queuedMux, queuedDgpuDis
     var pending = gpuModeId(mux, dgpu === 1)
     var current = gpuModeId(currentMux, currentDgpuDisable === 1)
     return pending === current ? "" : pending
+}
+
+// What the next reboot will actually do.  Empty when nothing is queued.
+// Eco from Ultimate is intentionally only the MUX half; saying "Eco" there
+// would hide the second reboot.
+function gpuModeRebootNotice(currentMux, currentDgpuDisable, queuedMux, queuedDgpuDisable) {
+    var pending = pendingGpuMode(currentMux, currentDgpuDisable, queuedMux, queuedDgpuDisable)
+    if (pending === "") return ""
+    var mux = (queuedMux === 0 || queuedMux === 1) ? queuedMux : currentMux
+    var dgpuQueued = queuedDgpuDisable === 0 || queuedDgpuDisable === 1
+    if (currentMux === 0 && mux === 1 && !(dgpuQueued && queuedDgpuDisable === 1))
+        return "Queued the move onto the iGPU (Standard). Reboot for that. Eco is a second reboot: shutdown applies dgpu_disable before the MUX, and powering the dGPU off while it still drives the panel freezes this laptop."
+    if (pending === "eco")
+        return "Queued Eco. Reboot to power the dGPU off. The panel is already on the iGPU, so this reboot does not change the MUX."
+    return "Queued " + gpuModeDef(pending).name + ". Reboot to apply. Firmware writes GPU mode only during shutdown."
 }
 
 // ============================================================

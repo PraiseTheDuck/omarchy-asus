@@ -94,8 +94,7 @@ Two details worth knowing:
 
 ### GPU modes
 
-`asusctl` represents GPU mode with two separate firmware attributes. The
-plugin writes the complete pair for every transition:
+`asusctl` represents GPU mode with two separate firmware attributes:
 
 | Mode | `dgpu_disable` | `gpu_mux_mode` |
 |---|---:|---:|
@@ -103,10 +102,25 @@ plugin writes the complete pair for every transition:
 | Standard | 0 | 1 |
 | Ultimate | 0 | 0 |
 
-`asusd` queues these settings and applies them safely during shutdown. Every
-GPU mode change therefore takes effect after a reboot, including Eco and
-Standard. On laptops without a MUX switch, Ultimate is disabled; if the
-firmware cannot disable the dGPU, Eco is disabled.
+`asusd` queues these and `asus-shutdown` writes them during reboot, in D-Bus
+path order. That order applies `dgpu_disable` before `gpu_mux_mode`. Queuing
+both for Eco while the MUX is still on the dGPU powers the discrete GPU off
+while it is still driving the panel, and the reboot freezes.
+
+The plugin therefore never queues that pair together:
+
+- Ultimate → Eco queues only `gpu_mux_mode = 1`. Reboot, then choose Eco again.
+  The second reboot queues only `dgpu_disable = 1`, with the panel already on
+  the iGPU.
+- Standard → Eco queues only `dgpu_disable = 1`.
+- Standard → Ultimate queues only `gpu_mux_mode = 0`. Rewriting an unchanged
+  `dgpu_disable = 0` returns EIO while `nvidia_drm` is loaded and aborts the
+  MUX write.
+- Eco → Ultimate queues both, which is safe: shutdown enables the dGPU before
+  handing it the panel.
+
+On laptops without a MUX switch, Ultimate is disabled; if the firmware cannot
+disable the dGPU, Eco is disabled.
 
 ## Development
 
