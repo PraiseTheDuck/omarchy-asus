@@ -14,6 +14,10 @@ const M = {}
 vm.createContext(M)
 vm.runInContext(fs.readFileSync(path.join(__dirname, "Model.js"), "utf8"), M)
 
+// Store the chosen performance profile for the power source currently in use.
+assert.deepEqual(M.profileCommand("Performance", false), ["asusctl", "profile", "set", "--ac", "Performance"])
+assert.deepEqual(M.profileCommand("Quiet", true), ["asusctl", "profile", "set", "--battery", "Quiet"])
+
 // ---------------------------------------------------------------- armoury
 const ARMOURY = `Multiple asusd interfaces devices found
 charge_mode:
@@ -124,6 +128,8 @@ const statusOnlyCommand = M.sensorCommand(false)[2]
 const metricsCommand = M.sensorCommand(true)[2]
 assert.ok(statusOnlyCommand.indexOf("runtime_status") >= 0)
 assert.equal(statusOnlyCommand.indexOf("nvidia-smi"), -1)
+assert.ok(statusOnlyCommand.indexOf("/sys/class/power_supply/BAT*") >= 0)
+assert.equal(statusOnlyCommand.indexOf("/sys/class/power_supply/BAT0"), -1)
 assert.ok(metricsCommand.indexOf("runtime_status") < metricsCommand.indexOf("nvidia-smi"))
 assert.ok(metricsCommand.indexOf('[ "$gpu_state" = active ]') >= 0)
 assert.equal(M.gpuMetricsAllowed("standard"), false)

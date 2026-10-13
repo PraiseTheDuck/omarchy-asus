@@ -35,8 +35,8 @@ that.
   already the display GPU. The same readings appear in the bar icon's tooltip,
   so "how hot is it right now" needs no click.
 - **Main** — performance mode (Quiet/Balanced/Performance, tinted by mode),
-  GPU mode (Eco/Standard/Ultimate), screen refresh rate and panel overdrive,
-  battery charge limit.
+  saved separately for AC and battery, plus GPU mode (Eco/Standard/Ultimate),
+  screen refresh rate and panel overdrive, battery charge limit.
 - **RGB** — keyboard lighting, filtered to the aura effects your laptop
   actually reports (`asusctl info --show-supported`), not a fixed list of
   twelve, plus brightness and the awake/boot/sleep power states.
@@ -64,7 +64,13 @@ feature set where Linux tooling allows it. What is deliberately absent:
 | CPU boost toggle | Needs root writes to `intel_pstate`/`cpufreq`; `asusctl` exposes no equivalent |
 | AutoTDP, FPS limiter, overlay | Windows-only mechanisms |
 | Per-key / per-zone RGB | `asusctl` exposes zones only on some models; single-colour effects only for now |
-| Automatic AC/battery profile switching | `asusctl` applies its own AC/battery profiles; not duplicated here |
+
+### Performance profiles
+
+Selecting Quiet, Balanced, or Performance saves the choice for the current
+power source with `asusctl profile set --ac` or `--battery`. The other source
+keeps its saved choice. `asusd` applies the matching profile when the charger
+is connected or disconnected. Scrolling the bar icon uses the same command.
 
 ### Screen refresh rate
 
